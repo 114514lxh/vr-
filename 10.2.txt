@@ -1,0 +1,3272 @@
+do
+    local qot = queue_on_teleport or (syn and syn.queue_on_teleport)
+    local checks = {
+        { "getrawmetatable", getrawmetatable },
+        { "setreadonly", setreadonly },
+        { "newcclosure", newcclosure },
+        { "getnamecallmethod", getnamecallmethod },
+        { "getgc", getgc },
+        { "queue_on_teleport", qot },
+    }
+    local missing, report = {}, "[VR Hands No-VR] UNC test:\n"
+    for _, c in ipairs(checks) do
+        local ok = type(c[2]) == "function"
+        report = report .. (" [%s] %s\n"):format(ok and "+" or "-", c[1])
+        if not ok then table.insert(missing, c[1]) end
+    end
+    print(report)
+    if #missing > 0 then
+        warn("[VR Hands No-VR] Missing: " .. table.concat(missing, ", "))
+        return
+    end
+    print("[VR Hands No-VR] UNC test passed - launching.")
+end
+
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+
+local hrs = [==[
+local env = (getgenv and getgenv()) or _G
+if env.__NoVR_Running then return end
+env.__NoVR_Running = true
+
+local VRService = game:GetService("VRService")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local identity = CFrame.identity
+
+local gyroSepEnabled = false
+local selHand = "R"
+local headFollowEnabled = true
+local handAnchorRot = { L = nil, R = nil }
+local handDir = {
+    L = { x = 0, y = 0, locked = false, lockWorldRot = nil },
+    R = { x = 0, y = 0, locked = false, lockWorldRot = nil },
+}
+local dirSliderX = 0
+local dirSliderY = 0
+
+local wheelHandEnabled = false
+local wheelOffset = { L = {x=0,y=0,z=0}, R = {x=0,y=0,z=0} }
+local WHEEL_MAX_XY  = 0.40
+local WHEEL_MAX_UP  = 0.40
+local WHEEL_MAX_FWD = 0.40
+local wheelRot = { L = {yaw=0,pitch=0,roll=0}, R = {yaw=0,pitch=0,roll=0} }
+local wheelRotSmooth = { L = {yaw=0,pitch=0,roll=0}, R = {yaw=0,pitch=0,roll=0} }
+local WHEEL_ROT_MAX  = 0.95
+local WHEEL_ROLL_MAX = 0.55
+local wheelOffsetSmooth = { L = {x=0,y=0,z=0}, R = {x=0,y=0,z=0} }
+local handTiltSmooth = { L = {pitch=0,yaw=0,roll=0}, R = {pitch=0,yaw=0,roll=0} }
+local WHEEL_AUTO_RETURN = true
+local WHEEL_RETURN_SPEED = 1.5
+
+local headGyroEnabled = false
+local headGyroBase = nil
+local headGyroLastYaw = 0
+local headGyroLastPitch = 0
+
+local freeCamMode = false
+local freeCamBodyCFrame = nil
+
+local recordMode = false
+local playbackMode = false
+local recordFrames = {}
+local recordCount = 0
+local maxRecordFrame = 0
+local playbackFrame = 1
+local frameCounter = 0
+local recordStartT = 0
+local RECORD_MAX_DURATION = 100
+
+local recordLibrary = {}
+local recordCounter = 0
+local RECORD_LIBRARY_MAX = 100
+local libraryPanelRef = nil
+local refreshLibraryListRef = nil
+
+local headBase, headKnob, headWheelOn
+
+local gyroBtnRef = nil
+local recordBtnRef = nil
+local playbackBtnRef = nil
+local freeCamBtnRef = nil
+local recStatusRef = nil
+local mouseWheelDrag = nil
+local activeWheelDrags = {}
+
+-- ✅ Hook 状态 & 命中计数
+local HOOK_OK = false
+local HOOK_HIT = { vrenabled = 0, cframeEnabled = 0, cframe = 0 }
+
+pcall(function()
+    local mt = getrawmetatable(game)
+    if not mt then
+        warn("[NoVR] 无法获取 game 的 metatable")
+        return
+    end
+    local oldIndex = mt.__index
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+
+    mt.__index = newcclosure(function(self, k)
+        if k == "VREnabled" then
+            if self == VRService or self == UIS then
+                HOOK_HIT.vrenabled = HOOK_HIT.vrenabled + 1
+                return true
+            end
+        end
+        return oldIndex(self, k)
+    end)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if method == "GetUserCFrameEnabled" then
+            if self == VRService or self == UIS then
+                HOOK_HIT.cframeEnabled = HOOK_HIT.cframeEnabled + 1
+                return true
+            end
+        elseif method == "GetUserCFrame" then
+            if self == VRService or self == UIS then
+                HOOK_HIT.cframe = HOOK_HIT.cframe + 1
+                return identity
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+
+    setreadonly(mt, true)
+    HOOK_OK = true
+end)
+print("[NoVR] VRService hook: " .. tostring(HOOK_OK))
+
+-- ✅ 诊断：每 5 秒打印 hook 命中数
+task.spawn(function()
+    while true do
+        task.wait(5)
+        print(string.format(
+            "[NoVR] Hook 命中: VREnabled=%d | GetUserCFrameEnabled=%d | GetUserCFrame=%d",
+            HOOK_HIT.vrenabled, HOOK_HIT.cframeEnabled, HOOK_HIT.cframe))
+    end
+end)
+
+task.spawn(function()
+    local function ensureFolder(p, n)
+        local f = p:FindFirstChild(n)
+        if not f then f = Instance.new("Folder"); f.Name = n; f.Parent = p end
+        return f
+    end
+    local function ensurePart(p, n)
+        local x = p:FindFirstChild(n)
+        if not x then
+            x = Instance.new("Part"); x.Name = n
+            x.Anchored = true; x.CanCollide = false; x.Transparency = 1
+            x.Size = Vector3.new(1,1,1); x.Parent = p
+        end
+        return x
+    end
+    local function populate(cam)
+        if not cam then return end
+        ensurePart(ensureFolder(cam, "VRCoreEffectParts"), "Cursor")
+        ensurePart(ensureFolder(cam, "VRCorePanelParts"), "BottomBar_Part")
+    end
+    populate(workspace.CurrentCamera)
+    workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        populate(workspace.CurrentCamera)
+    end)
+    local t0 = os.clock()
+    while os.clock() - t0 < 30 do
+        populate(workspace.CurrentCamera)
+        task.wait(0.1)
+    end
+end)
+
+local function naturalSway(t, seed)
+    return math.sin(t * 0.63 + seed) * 0.55
+         + math.sin(t * 1.19 + seed * 2.71) * 0.28
+         + math.sin(t * 1.87 + seed * 5.13) * 0.17
+end
+local function slowDrift(t, seed)
+    return math.sin(t * 0.11 + seed) * 0.5
+         + math.sin(t * 0.23 + seed * 2.31) * 0.3
+         + math.sin(t * 0.43 + seed * 3.77) * 0.2
+end
+local function breathDrift(t, seed)
+    return math.sin(t * 0.07 + seed) * 0.6
+         + math.sin(t * 0.13 + seed * 1.87) * 0.4
+end
+
+local D = math.rad
+local function R(x,y,z) return CFrame.fromEulerAnglesXYZ(D(x or 0), D(y or 0), D(z or 0)) end
+
+local GESTURES = {
+    punch = { dur = 5.0, kfs = {
+        {0.00, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {0.10, Vector3.new(0.02,  0.02, -0.05), R(-5, 0, -5)},
+        {0.22, Vector3.new(0.05, -0.02, -0.42), R(-12, 0, -8)},
+        {0.30, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -5)},
+        {0.40, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {0.52, Vector3.new(0.03,  0.01, -0.06), R(-6, 0, -6)},
+        {0.64, Vector3.new(0.06, -0.03, -0.46), R(-14, 0, -10)},
+        {0.72, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {0.82, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {0.94, Vector3.new(0.03,  0.02, -0.06), R(-6, 0, -6)},
+        {1.06, Vector3.new(0.05, -0.04, -0.50), R(-16, 0, -10)},
+        {1.16, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {1.26, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {1.38, Vector3.new(0.04,  0.01, -0.06), R(-6, 0, -7)},
+        {1.50, Vector3.new(0.07, -0.03, -0.48), R(-15, 0, -11)},
+        {1.60, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {1.70, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {1.82, Vector3.new(0.03,  0.02, -0.06), R(-7, 0, -6)},
+        {1.94, Vector3.new(0.06, -0.04, -0.52), R(-17, 0, -10)},
+        {2.04, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {2.14, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {2.26, Vector3.new(0.04,  0.01, -0.06), R(-6, 0, -7)},
+        {2.38, Vector3.new(0.05, -0.03, -0.46), R(-14, 0, -11)},
+        {2.48, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {2.58, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {2.70, Vector3.new(0.03,  0.02, -0.06), R(-6, 0, -6)},
+        {2.82, Vector3.new(0.07, -0.04, -0.52), R(-16, 0, -10)},
+        {2.92, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {3.02, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {3.14, Vector3.new(0.04,  0.01, -0.06), R(-6, 0, -7)},
+        {3.26, Vector3.new(0.06, -0.03, -0.48), R(-15, 0, -11)},
+        {3.36, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {3.46, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {3.58, Vector3.new(0.03,  0.02, -0.06), R(-7, 0, -6)},
+        {3.70, Vector3.new(0.05, -0.04, -0.50), R(-17, 0, -10)},
+        {3.80, Vector3.new(0.02,  0.02, -0.05), R(-3, 0, -6)},
+        {3.90, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+        {4.02, Vector3.new(0.04,  0.02, -0.07), R(-6, 0, -7)},
+        {4.20, Vector3.new(0.08, -0.05, -0.55), R(-18, 0, -12)},
+        {4.40, Vector3.new(0.03,  0.02, -0.06), R(-4, 0, -7)},
+        {4.70, Vector3.new(0.01,  0.01, -0.02), R(-1, 0, -2)},
+        {5.00, Vector3.new(0.00,  0.00,  0.00), CFrame.new()},
+    }},
+    come = { dur = 2.2, kfs = {
+        {0.00, Vector3.new(0,0,0),             CFrame.new()},
+        {0.30, Vector3.new(0.15, 0.22, -0.15), R(-25, 0, -35)},
+        {0.50, Vector3.new(0.15, 0.22, -0.15), R( 45, 0, -35)},
+        {0.70, Vector3.new(0.15, 0.22, -0.15), R(-25, 0, -35)},
+        {0.90, Vector3.new(0.15, 0.22, -0.15), R( 45, 0, -35)},
+        {1.10, Vector3.new(0.15, 0.22, -0.15), R(-25, 0, -35)},
+        {1.30, Vector3.new(0.15, 0.22, -0.15), R( 45, 0, -35)},
+        {1.55, Vector3.new(0.15, 0.22, -0.15), R( 10, 0, -35)},
+        {2.20, Vector3.new(0,0,0),             CFrame.new()},
+    }},
+    thumb = { dur = 2.0, kfs = {
+        {0.00, Vector3.new(0,0,0),             CFrame.new()},
+        {0.40, Vector3.new(0.18, 0.25, -0.18), R(-15, 0, -30)},
+        {1.40, Vector3.new(0.18, 0.25, -0.18), R(-15, 0, -30)},
+        {2.00, Vector3.new(0,0,0),             CFrame.new()},
+    }},
+    point = { dur = 1.8, kfs = {
+        {0.00, Vector3.new(0,0,0),             CFrame.new()},
+        {0.40, Vector3.new(0.10, 0.15, -0.35), R(-10, 0, 0)},
+        {1.40, Vector3.new(0.10, 0.15, -0.35), R(-10, 0, 0)},
+        {1.80, Vector3.new(0,0,0),             CFrame.new()},
+    }},
+    fist = { dur = 3.2, kfs = {
+        {0.00, Vector3.new(0,0,0),                CFrame.new()},
+        {0.45, Vector3.new(0.05, 0.30, -0.15),    R(-15, 0, -20)},
+        {0.90, Vector3.new(-0.05, 0.40, -0.45),   R(-40, 0, -35)},
+        {1.15, Vector3.new(-0.05, 0.40, -0.45),   R(-25, 0, -35)},
+        {1.40, Vector3.new(-0.05, 0.40, -0.45),   R(-55, 0, -35)},
+        {1.65, Vector3.new(-0.05, 0.40, -0.45),   R(-25, 0, -35)},
+        {1.90, Vector3.new(-0.05, 0.40, -0.45),   R(-55, 0, -35)},
+        {2.15, Vector3.new(-0.05, 0.40, -0.45),   R(-25, 0, -35)},
+        {2.40, Vector3.new(-0.05, 0.40, -0.45),   R(-50, 0, -35)},
+        {2.85, Vector3.new(0.05, 0.22, -0.18),    R(-15, 0, -20)},
+        {3.20, Vector3.new(0,0,0),                CFrame.new()},
+    }},
+}
+
+local function sampleGesture(g, t)
+    local kfs = g.kfs
+    if t <= kfs[1][1] then return kfs[1][2], kfs[1][3] end
+    if t >= kfs[#kfs][1] then return kfs[#kfs][2], kfs[#kfs][3] end
+    for i = 1, #kfs - 1 do
+        local a, b = kfs[i], kfs[i+1]
+        if t >= a[1] and t <= b[1] then
+            local f = (t - a[1]) / (b[1] - a[1])
+            f = f * f * (3 - 2 * f)
+            return a[2]:Lerp(b[2], f), a[3]:Lerp(b[3], f)
+        end
+    end
+    return Vector3.zero, CFrame.new()
+end
+
+task.spawn(function()
+    local lp = Players.LocalPlayer
+    while not lp do task.wait() lp = Players.LocalPlayer end
+    local uid = tostring(lp.UserId)
+
+    local rig, vrPlayers
+    local t0 = os.clock()
+    while os.clock() - t0 < 60 do
+        vrPlayers = workspace:FindFirstChild("VRPlayers")
+        if vrPlayers then
+            rig = vrPlayers:FindFirstChild(uid)
+            if rig then break end
+        end
+        task.wait(0.5)
+    end
+
+    if not rig then warn("[NoVR] Rig not found after 60s.") return end
+    _G.__NoVR_rig = rig
+
+    rig:WaitForChild("VRHead", 20)
+    rig:WaitForChild("LeftHand", 20)
+    rig:WaitForChild("RightHand", 20)
+
+    local scaleVal = rig:FindFirstChild("VRScale")
+    local cam = workspace.CurrentCamera
+
+    local S = {
+        reach = 0.80, spread = 0.34, height = -0.25,
+        sens = 0.016, sensPitch = 0.016, smooth = 20,
+        gyroEnabled = true,
+        gyroRotK = 1.40,
+        gyroPosK = 0.85,
+        gyroPosMax = 0.9,
+        gyroRotSmooth = 12,
+        gyroRotMax = 0.9,
+        gyroAngleMax = 1.2,
+        headGyroSens = 0.5,
+        handMirrorL = 1.0, handMirrorR = -1.0,
+        swayEnabled = true,
+        handSway = 0.14,
+        handRotSway = 0.13,
+        headSwayYaw = 0.040,
+        headSwayPitch = 0.028,
+        headSwayPos = 0.018,
+        breathAmp = 0.012,
+        breathSpeed = 0.28,
+        breathHeadK = 0.6,
+        gestureBlend = 12,
+        moveK = 0.16, speedMult = 0.2,
+        moveAccel = 7.0,
+        moveDecel = 4.0,
+        scale = 10, grabRadiusMult = 3.2,
+        toggleGrabMode = false, look = true,
+        handInertia = 0.5,
+        handInertiaDecay = 6,
+        rollK = 0.30, rollMax = 0.55,
+        rollSmooth = 6, rollReturnSmooth = 3.5,
+        pitchTiltK = 0.25, pitchTiltMax = 0.45,
+        pitchTiltSmooth = 6, pitchTiltReturnSmooth = 3.5,
+        manualTiltMax = 1.5708,
+        manualReturnSmooth = 6,
+    }
+
+    local gyroBase, gyroNow = nil, nil
+    local swayOffsetL, swayOffsetR = Vector3.zero, Vector3.zero
+    local rotL, rotR = CFrame.new(), CFrame.new()
+    local gyroPosL, gyroPosR = Vector3.zero, Vector3.zero
+    local handInertiaVec = Vector3.zero
+    local prevRotForInertia = CFrame.new()
+    local moveVel = Vector3.zero
+
+    local gestureCur = nil
+    local gestureT = 0
+    local gestureHand = "R"
+    local gesturePosL, gesturePosR = Vector3.zero, Vector3.zero
+    local gestureRotL, gestureRotR = CFrame.new(), CFrame.new()
+
+    local spinMode = false
+    local spinAngle = 0
+    local grabOverride = { L = false, R = false }
+
+    local roll, pitchTilt = 0, 0
+    local manualRoll, manualPitch = 0, 0
+    local headDragging = false
+    local headTiltTargetRoll, headTiltTargetPitch = 0, 0
+    local autoTiltEnabled = true
+
+    local vrm, Input
+
+    local function gesturePlay(name, hand)
+        local g = GESTURES[name]
+        if not g then return end
+        gestureCur = g
+        gestureT = 0
+        gestureHand = hand or "R"
+    end
+
+    local function resetHands()
+        rotL = CFrame.new()
+        rotR = CFrame.new()
+        gyroPosL = Vector3.zero
+        gyroPosR = Vector3.zero
+        swayOffsetL = Vector3.zero
+        swayOffsetR = Vector3.zero
+        handInertiaVec = Vector3.zero
+        gestureCur = nil
+        gestureT = 0
+        gesturePosL = Vector3.zero
+        gesturePosR = Vector3.zero
+        gestureRotL = CFrame.new()
+        gestureRotR = CFrame.new()
+        for _, side in ipairs({"L", "R"}) do
+            local off = wheelOffset[side]
+            off.x = 0; off.y = 0; off.z = 0
+            local rot = wheelRot[side]
+            rot.yaw = 0; rot.pitch = 0; rot.roll = 0
+            local oS = wheelOffsetSmooth[side]
+            oS.x = 0; oS.y = 0; oS.z = 0
+            local rS = wheelRotSmooth[side]
+            rS.yaw = 0; rS.pitch = 0; rS.roll = 0
+            local tS = handTiltSmooth[side]
+            tS.pitch = 0; tS.yaw = 0; tS.roll = 0
+        end
+        handDir.L.x = 0; handDir.L.y = 0
+        handDir.L.locked = false; handDir.L.lockWorldRot = nil
+        handDir.R.x = 0; handDir.R.y = 0
+        handDir.R.locked = false; handDir.R.lockWorldRot = nil
+        if gyroNow then gyroBase = gyroNow end
+        spinMode = false
+        spinAngle = 0
+        print("[NoVR] 手部已复位")
+    end
+
+    local function refreshInput()
+        if Input then return Input end
+        for _, o in pairs(getgc(true)) do
+            if type(o) == "table" and rawget(o,"directionLateral") ~= nil
+            and rawget(o,"rFist") ~= nil and rawget(o,"turnDirection") ~= nil then
+                Input = o
+                return Input
+            end
+        end
+        return Input
+    end
+
+    local function installGetUserCFrameHook()
+        local ok, VRUtils = pcall(function()
+            return require(lp.PlayerScripts.ClientLoader.PlayerModule.VRModule.VRUtils)
+        end)
+        if not (ok and type(VRUtils) == "table") then return false end
+        VRUtils.GetUserCFrame = function(uc, scale)
+            -- ✅ scale 类型保护，避免 nil 崩溃
+            if type(scale) ~= "number" or scale ~= scale then
+                scale = cam.HeadScale
+            end
+            if type(scale) ~= "number" or scale ~= scale then
+                scale = 60
+            end
+            if scale <= 1 then
+                local sv = (scaleVal and scaleVal.Value) or 1
+                scale = math.max(sv * 60, 6)
+            end
+
+            local baseC, swayOff, rot, gPos, gRot, gPos2
+            local side
+            if uc == Enum.UserCFrame.LeftHand then
+                baseC = CFrame.new(-S.spread, S.height, -S.reach)
+                swayOff = swayOffsetL; rot = rotL
+                gPos = gesturePosL; gRot = gestureRotL
+                gPos2 = gyroPosL
+                side = "L"
+            elseif uc == Enum.UserCFrame.RightHand then
+                baseC = CFrame.new(S.spread, S.height, -S.reach)
+                swayOff = swayOffsetR; rot = rotR
+                gPos = gesturePosR; gRot = gestureRotR
+                gPos2 = gyroPosR
+                side = "R"
+            else
+                return identity
+            end
+            local iner = handInertiaVec
+            if uc == Enum.UserCFrame.LeftHand and grabOverride.L then iner = Vector3.zero end
+            if uc == Enum.UserCFrame.RightHand and grabOverride.R then iner = Vector3.zero end
+            local hd = (uc == Enum.UserCFrame.LeftHand) and handDir.L or handDir.R
+            local applyManual = true
+            if gyroSepEnabled and selHand ~= "B" then
+                if selHand == "L" and uc ~= Enum.UserCFrame.LeftHand then applyManual = false end
+                if selHand == "R" and uc ~= Enum.UserCFrame.RightHand then applyManual = false end
+            end
+            local dirCF = CFrame.fromEulerAnglesYXZ(hd.y * 1.2, hd.x * 1.2, 0)
+            local wOff = (uc == Enum.UserCFrame.LeftHand) and wheelOffsetSmooth.L or wheelOffsetSmooth.R
+            local wVec = Vector3.new(wOff.x, wOff.y, -wOff.z)
+            local pos2 = (baseC.Position + swayOff + gPos + gPos2 + iner + wVec) * scale
+            local selfRot
+            if applyManual and hd.locked and hd.lockWorldRot then
+                selfRot = cam.CFrame.Rotation:Inverse() * hd.lockWorldRot
+            elseif applyManual then
+                selfRot = (rot * dirCF) * gRot
+            else
+                selfRot = rot * gRot
+            end
+            if wheelHandEnabled then
+                local wr = wheelRotSmooth[side]
+                if wr and (wr.yaw ~= 0 or wr.pitch ~= 0 or wr.roll ~= 0) then
+                    selfRot = selfRot * CFrame.fromEulerAnglesYXZ(wr.pitch, wr.yaw, wr.roll)
+                end
+                local ts = handTiltSmooth[side]
+                if ts and (ts.pitch ~= 0 or ts.yaw ~= 0 or ts.roll ~= 0) then
+                    selfRot = selfRot * CFrame.fromEulerAnglesYXZ(ts.pitch, ts.yaw, ts.roll)
+                end
+            end
+            local handLocal = CFrame.new(pos2) * selfRot
+            local finalCF
+            if freeCamMode and freeCamBodyCFrame then
+                local bodyRot = freeCamBodyCFrame.Rotation
+                local worldOffset = bodyRot * pos2
+                local worldRot = bodyRot * selfRot
+                local wantedWorld = CFrame.new(freeCamBodyCFrame.Position + worldOffset) * worldRot
+                finalCF = cam.CFrame:Inverse() * wantedWorld
+            elseif headFollowEnabled then
+                handAnchorRot[side] = nil
+                finalCF = handLocal
+            else
+                if not handAnchorRot[side] then
+                    handAnchorRot[side] = cam.CFrame.Rotation
+                end
+                local aRot = handAnchorRot[side]
+                local worldOffset = aRot * pos2
+                local worldRot = aRot * selfRot
+                local basePos = _G.__NoVR_camPos or cam.CFrame.Position
+                local wantedWorld = CFrame.new(basePos + worldOffset) * worldRot
+                finalCF = cam.CFrame:Inverse() * wantedWorld
+            end
+
+            if recordMode then
+                local cur = recordFrames[frameCounter]
+                if not cur then
+                    cur = { L = nil, R = nil }
+                    recordFrames[frameCounter] = cur
+                    if frameCounter > maxRecordFrame then
+                        maxRecordFrame = frameCounter
+                    end
+                end
+                cur[side] = finalCF
+                return finalCF
+            end
+
+            if playbackMode then
+                local rec = recordFrames[playbackFrame]
+                if rec and rec[side] then
+                    return rec[side]
+                end
+                return finalCF
+            end
+
+            return finalCF
+        end
+        return true
+    end
+
+    installGetUserCFrameHook()
+    task.spawn(function()
+        while true do
+            task.wait(5)
+            pcall(installGetUserCFrameHook)
+        end
+    end)
+
+    for _ = 1, 60 do
+        for _, o in pairs(getgc(true)) do
+            if type(o) == "table" then
+                if not Input and rawget(o,"directionLateral") ~= nil
+                and rawget(o,"rFist") ~= nil and rawget(o,"turnDirection") ~= nil then
+                    Input = o
+                end
+                if not vrm and rawget(o,"HeadsetPart") ~= nil and rawget(o,"Input") ~= nil
+                and rawget(o,"CharacterScale") ~= nil and rawget(o,"DataManager") ~= nil then
+                    vrm = o
+                    if not Input then Input = rawget(o,"Input") end
+                end
+            end
+        end
+        if Input and vrm then break end
+        task.wait(0.2)
+    end
+
+    task.spawn(function()
+        for _ = 1, 100 do
+            pcall(function() RunService:UnbindFromRenderStep("Inputs") end)
+            task.wait(0.1)
+        end
+    end)
+
+    if vrm then
+        pcall(function()
+            if vrm.PropManager then
+                local pmMT = getrawmetatable(vrm.PropManager)
+                if pmMT and rawget(pmMT, "GetBestGrabPartInRadius") then
+                    local orig = pmMT.GetBestGrabPartInRadius
+                    setreadonly(pmMT, false)
+                    pmMT.GetBestGrabPartInRadius = function(self, root, prox, radius, scale, ...)
+                        local comp = 10 / math.max(S.scale, 0.1)
+                        return orig(self, root, prox, radius * comp * S.grabRadiusMult, scale, ...)
+                    end
+                    setreadonly(pmMT, true)
+                end
+            end
+            if vrm.CharacterManager then
+                local cmMT = getrawmetatable(vrm.CharacterManager)
+                if cmMT and rawget(cmMT, "GetClosestCharacterInRadius") then
+                    local orig = cmMT.GetClosestCharacterInRadius
+                    setreadonly(cmMT, false)
+                    cmMT.GetClosestCharacterInRadius = function(self, pos, radius, ...)
+                        local comp = 10 / math.max(S.scale, 0.1)
+                        return orig(self, pos, radius * comp * S.grabRadiusMult, ...)
+                    end
+                    setreadonly(cmMT, true)
+                end
+            end
+        end)
+    end
+
+    task.spawn(function()
+        local tick = 0
+        while true do
+            task.wait(2)
+            tick = tick + 1
+            if not Input and tick % 5 == 0 then
+                pcall(refreshInput)
+            end
+        end
+    end)
+
+    local function setScale(n)
+        n = math.clamp(n, 0.1, 100)
+        S.scale = n
+        if scaleVal then pcall(function() scaleVal.Value = n / 10 end) end
+        if vrm and vrm.DataManager and vrm.DataManager.SettingsManager then
+            pcall(function() vrm.DataManager.SettingsManager:SetValue("vrscale", n) end)
+        end
+    end
+    setScale(S.scale)
+    cam.HeadLocked = true
+
+    local yaw, pitch
+    do
+        local lv = cam.CFrame.LookVector
+        yaw = math.atan2(-lv.X, -lv.Z)
+        pitch = math.asin(math.clamp(lv.Y, -1, 1))
+    end
+    local targetYaw, targetPitch = yaw, pitch
+    local camPos = cam.CFrame.Position
+    _G.__NoVR_camPos = camPos
+    prevRotForInertia = CFrame.fromEulerAnglesYXZ(pitch, yaw, 0)
+    local keys = {}
+
+    local function setLook(v)
+        S.look = v
+        if not UIS.TouchEnabled then
+            UIS.MouseBehavior = v and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
+            UIS.MouseIconEnabled = not v
+        end
+    end
+    setLook(S.look)
+
+    do
+        local plr = lp
+        local pgui = plr:WaitForChild("PlayerGui")
+
+        local wheelGui = Instance.new("ScreenGui")
+        wheelGui.Name = "NoVR_WheelHand"
+        wheelGui.ResetOnSpawn = false
+        wheelGui.IgnoreGuiInset = true
+        wheelGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        wheelGui.DisplayOrder = 50
+        wheelGui.Enabled = false
+        wheelGui.Parent = pgui
+
+        local wheelL, wheelLKnob, wheelR, wheelRKnob
+        local sliderL, sliderLKnob, sliderR, sliderRKnob
+
+        local function makeWheel(xScale, yScale, label)
+            local wheel = Instance.new("Frame")
+            wheel.Name = "WheelBg"
+            wheel.AnchorPoint = Vector2.new(0.5, 0.5)
+            wheel.Position = UDim2.fromScale(xScale, yScale)
+            wheel.Size = UDim2.fromOffset(140, 140)
+            wheel.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+            wheel.BackgroundTransparency = 0.45
+            wheel.BorderSizePixel = 0
+            wheel.Active = false
+            wheel.Parent = wheelGui
+            Instance.new("UICorner", wheel).CornerRadius = UDim.new(1, 0)
+            local ws = Instance.new("UIStroke", wheel)
+            ws.Color = Color3.fromRGB(255, 255, 255); ws.Transparency = 0.35; ws.Thickness = 2
+
+            local crossH = Instance.new("Frame", wheel)
+            crossH.Size = UDim2.new(0.86, 0, 0, 1)
+            crossH.Position = UDim2.new(0.07, 0, 0.5, 0)
+            crossH.AnchorPoint = Vector2.new(0, 0.5)
+            crossH.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            crossH.BackgroundTransparency = 0.75
+            crossH.BorderSizePixel = 0
+
+            local crossV = Instance.new("Frame", wheel)
+            crossV.Size = UDim2.new(0, 1, 0.86, 0)
+            crossV.Position = UDim2.new(0.5, 0, 0.07, 0)
+            crossV.AnchorPoint = Vector2.new(0.5, 0)
+            crossV.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            crossV.BackgroundTransparency = 0.75
+            crossV.BorderSizePixel = 0
+
+            local dot = Instance.new("Frame", wheel)
+            dot.Size = UDim2.fromOffset(8, 8)
+            dot.AnchorPoint = Vector2.new(0.5, 0.5)
+            dot.Position = UDim2.fromScale(0.5, 0.5)
+            dot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            dot.BackgroundTransparency = 0.55
+            dot.BorderSizePixel = 0
+            Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+            local knob = Instance.new("Frame", wheel)
+            knob.Name = "Knob"
+            knob.Size = UDim2.fromOffset(46, 46)
+            knob.AnchorPoint = Vector2.new(0.5, 0.5)
+            knob.Position = UDim2.fromScale(0.5, 0.5)
+            knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            knob.BackgroundTransparency = 0.1
+            knob.BorderSizePixel = 0
+            Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+            local ks = Instance.new("UIStroke", knob)
+            ks.Color = Color3.fromRGB(0, 0, 0); ks.Transparency = 0.5; ks.Thickness = 2
+
+            local lbl = Instance.new("TextLabel", wheel)
+            lbl.Size = UDim2.new(1, 0, 0, 18)
+            lbl.Position = UDim2.new(0, 0, 0, -22)
+            lbl.BackgroundTransparency = 1
+            lbl.Text = label
+            lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+            lbl.Font = Enum.Font.SourceSansBold
+            lbl.TextSize = 14
+
+            return wheel, knob
+        end
+
+        local function makeVSlider(xScale, yScale, label)
+            local track = Instance.new("Frame")
+            track.Name = "SliderBg"
+            track.AnchorPoint = Vector2.new(0.5, 0.5)
+            track.Position = UDim2.fromScale(xScale, yScale)
+            track.Size = UDim2.fromOffset(30, 140)
+            track.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+            track.BackgroundTransparency = 0.45
+            track.BorderSizePixel = 0
+            track.Active = false
+            track.Parent = wheelGui
+            Instance.new("UICorner", track).CornerRadius = UDim.new(0, 12)
+            local ts = Instance.new("UIStroke", track)
+            ts.Color = Color3.fromRGB(255, 255, 255); ts.Transparency = 0.35; ts.Thickness = 2
+
+            local mid = Instance.new("Frame", track)
+            mid.Size = UDim2.new(0.7, 0, 0, 1)
+            mid.Position = UDim2.fromScale(0.15, 0.5)
+            mid.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            mid.BackgroundTransparency = 0.7
+            mid.BorderSizePixel = 0
+
+            local knob = Instance.new("Frame", track)
+            knob.Name = "Knob"
+            knob.Size = UDim2.new(0.82, 0, 0, 28)
+            knob.AnchorPoint = Vector2.new(0.5, 0.5)
+            knob.Position = UDim2.fromScale(0.5, 0.5)
+            knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            knob.BackgroundTransparency = 0.1
+            knob.BorderSizePixel = 0
+            Instance.new("UICorner", knob).CornerRadius = UDim.new(0, 8)
+            local ks = Instance.new("UIStroke", knob)
+            ks.Color = Color3.fromRGB(0, 0, 0); ks.Transparency = 0.5; ks.Thickness = 2
+
+            local lbl = Instance.new("TextLabel", track)
+            lbl.Size = UDim2.new(0, 70, 0, 16)
+            lbl.Position = UDim2.new(0.5, 0, 0, -20)
+            lbl.AnchorPoint = Vector2.new(0.5, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Text = label
+            lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+            lbl.Font = Enum.Font.SourceSansBold
+            lbl.TextSize = 12
+
+            return track, knob
+        end
+
+        wheelL, wheelLKnob = makeWheel(0.30, 0.55, "左手")
+        wheelR, wheelRKnob = makeWheel(0.70, 0.55, "右手")
+        sliderL, sliderLKnob = makeVSlider(0.30, 0.55, "左手上下")
+        sliderR, sliderRKnob = makeVSlider(0.70, 0.55, "右手上下")
+        sliderL.Position = UDim2.new(0.30, 0, 0.28, 0)
+        sliderR.Position = UDim2.new(0.70, 0, 0.28, 0)
+
+        local function getWheelFrame(side) return side == "L" and wheelL or wheelR end
+        local function getWheelKnob(side)  return side == "L" and wheelLKnob or wheelRKnob end
+        local function getSliderFrame(side) return side == "L" and sliderL or sliderR end
+        local function getSliderKnob(side)  return side == "L" and sliderLKnob or sliderRKnob end
+
+        local function findWheelDrag(pos)
+            for _, side in ipairs({"L", "R"}) do
+                local wf = getWheelFrame(side)
+                if wf and wf.Visible then
+                    local ap, as = wf.AbsolutePosition, wf.AbsoluteSize
+                    local cx, cy = ap.X + as.X * 0.5, ap.Y + as.Y * 0.5
+                    local r = as.X * 0.5
+                    local dx, dy = pos.X - cx, pos.Y - cy
+                    if dx * dx + dy * dy <= r * r then
+                        return { side = side, kind = "wheel" }
+                    end
+                end
+            end
+            for _, side in ipairs({"L", "R"}) do
+                local sf = getSliderFrame(side)
+                if sf and sf.Visible then
+                    local ap, as = sf.AbsolutePosition, sf.AbsoluteSize
+                    if pos.X >= ap.X - 14 and pos.X <= ap.X + as.X + 14
+                       and pos.Y >= ap.Y - 14 and pos.Y <= ap.Y + as.Y + 14 then
+                        return { side = side, kind = "slider" }
+                    end
+                end
+            end
+            return nil
+        end
+
+        local function applyWheelDrag(drag, pos)
+            if drag.kind == "wheel" then
+                local wf = getWheelFrame(drag.side)
+                local kn = getWheelKnob(drag.side)
+                if not wf or not kn then return end
+                local ap, as = wf.AbsolutePosition, wf.AbsoluteSize
+                local cx, cy = ap.X + as.X * 0.5, ap.Y + as.Y * 0.5
+                local r = as.X * 0.5
+                local maxR = r * 0.75
+                local dx, dy = pos.X - cx, pos.Y - cy
+                local dist = math.sqrt(dx * dx + dy * dy)
+                if dist > maxR then dx, dy = dx / dist * maxR, dy / dist * maxR end
+                local nx, ny = dx / maxR, dy / maxR
+                if math.abs(nx) < 0.10 then nx = 0 end
+                if math.abs(ny) < 0.10 then ny = 0 end
+                kn.Position = UDim2.new(0.5, nx * maxR, 0.5, ny * maxR)
+
+                local magRaw = math.min(math.sqrt(nx*nx + ny*ny), 1)
+                local mag = magRaw * magRaw
+
+                local off = wheelOffset[drag.side]
+                off.x =  nx * WHEEL_MAX_XY * mag
+                off.z = -ny * WHEEL_MAX_FWD * mag
+
+                local rot = wheelRot[drag.side]
+                rot.yaw   =  nx * WHEEL_ROT_MAX * mag
+                rot.pitch = -ny * WHEEL_ROT_MAX * mag
+                rot.roll  = -nx * WHEEL_ROLL_MAX * mag * 0.6
+            elseif drag.kind == "slider" then
+                local sf = getSliderFrame(drag.side)
+                local kn = getSliderKnob(drag.side)
+                if not sf or not kn then return end
+                local ap, as = sf.AbsolutePosition, sf.AbsoluteSize
+                local knobH = kn.AbsoluteSize.Y
+                local halfRange = as.Y * 0.5 - knobH * 0.5
+                if halfRange <= 0 then return end
+                local cy = ap.Y + as.Y * 0.5
+                local y = math.clamp(pos.Y, cy - halfRange, cy + halfRange)
+                local ny = (y - cy) / halfRange
+                if math.abs(ny) < 0.10 then ny = 0 end
+                kn.Position = UDim2.new(0.5, 0, 0, (cy + ny * halfRange) - ap.Y)
+
+                local off = wheelOffset[drag.side]
+                off.y = -ny * WHEEL_MAX_UP
+            end
+        end
+
+        UIS.InputBegan:Connect(function(input, gp)
+            if gp then return end
+            if not (wheelHandEnabled and wheelGui.Enabled) then return end
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Touch then
+                local d = findWheelDrag(input.Position)
+                if d then activeWheelDrags[input] = d end
+            elseif t == Enum.UserInputType.MouseButton1 then
+                local d = findWheelDrag(input.Position)
+                if d then mouseWheelDrag = d end
+            end
+        end)
+
+        UIS.InputChanged:Connect(function(input)
+            if not (wheelHandEnabled and wheelGui.Enabled) then return end
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Touch then
+                local d = activeWheelDrags[input]
+                if d then applyWheelDrag(d, input.Position) end
+            elseif t == Enum.UserInputType.MouseMovement then
+                if mouseWheelDrag then applyWheelDrag(mouseWheelDrag, input.Position) end
+            end
+        end)
+
+        UIS.InputEnded:Connect(function(input)
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Touch then
+                activeWheelDrags[input] = nil
+            elseif t == Enum.UserInputType.MouseButton1 then
+                mouseWheelDrag = nil
+            end
+        end)
+
+        _G.__NoVR_setWheelHand = function(v)
+            wheelHandEnabled = v
+            wheelGui.Enabled = v
+            if v then
+            else
+                wheelRot.L.yaw = 0; wheelRot.L.pitch = 0; wheelRot.L.roll = 0
+                wheelRot.R.yaw = 0; wheelRot.R.pitch = 0; wheelRot.R.roll = 0
+                wheelOffset.L.x = 0; wheelOffset.L.y = 0; wheelOffset.L.z = 0
+                wheelOffset.R.x = 0; wheelOffset.R.y = 0; wheelOffset.R.z = 0
+                if wheelLKnob then wheelLKnob.Position = UDim2.fromScale(0.5, 0.5) end
+                if wheelRKnob then wheelRKnob.Position = UDim2.fromScale(0.5, 0.5) end
+                if sliderLKnob then sliderLKnob.Position = UDim2.fromScale(0.5, 0.5) end
+                if sliderRKnob then sliderRKnob.Position = UDim2.fromScale(0.5, 0.5) end
+            end
+            for k in pairs(activeWheelDrags) do activeWheelDrags[k] = nil end
+            mouseWheelDrag = nil
+        end
+        _G.__NoVR_isWheelHand = function() return wheelHandEnabled end
+        _G.__NoVR_findWheelDrag = findWheelDrag
+        _G.__NoVR_wheelGui = wheelGui
+        _G.__NoVR_wheelDragging = function()
+            if mouseWheelDrag then return true end
+            return next(activeWheelDrags) ~= nil
+        end
+        _G.__NoVR_wheelUi = {
+            wheelLKnob = wheelLKnob, wheelRKnob = wheelRKnob,
+            sliderLKnob = sliderLKnob, sliderRKnob = sliderRKnob,
+        }
+    end
+
+    if UIS.TouchEnabled then
+        pcall(function()
+            UIS.DeviceRotationChanged:Connect(function(_, cf)
+                if not cf then return end
+                gyroNow = cf
+                if not gyroBase then gyroBase = cf end
+            end)
+        end)
+    end
+
+    UIS.InputBegan:Connect(function(io)
+        if io.UserInputType == Enum.UserInputType.Keyboard then
+            keys[io.KeyCode] = true
+            if io.KeyCode == Enum.KeyCode.LeftAlt then setLook(not S.look) end
+            if io.KeyCode == Enum.KeyCode.Equals then setScale(S.scale + 1) end
+            if io.KeyCode == Enum.KeyCode.Minus then setScale(S.scale - 1) end
+            if io.KeyCode == Enum.KeyCode.LeftBracket then S.grabRadiusMult = math.clamp(S.grabRadiusMult - 0.1, 0.1, 10) end
+            if io.KeyCode == Enum.KeyCode.RightBracket then S.grabRadiusMult = math.clamp(S.grabRadiusMult + 0.1, 0.1, 10) end
+            if io.KeyCode == Enum.KeyCode.Semicolon then S.speedMult = math.clamp(S.speedMult - 0.1, 0.1, 10) end
+            if io.KeyCode == Enum.KeyCode.Quote then S.speedMult = math.clamp(S.speedMult + 0.1, 0.1, 10) end
+            if io.KeyCode == Enum.KeyCode.G then S.toggleGrabMode = not S.toggleGrabMode end
+            if io.KeyCode == Enum.KeyCode.Comma then
+                S.sens = math.clamp(S.sens - 0.002, 0.002, 0.05); S.sensPitch = S.sens
+            end
+            if io.KeyCode == Enum.KeyCode.Period then
+                S.sens = math.clamp(S.sens + 0.002, 0.002, 0.05); S.sensPitch = S.sens
+            end
+            if io.KeyCode == Enum.KeyCode.One then gesturePlay("punch", "R") end
+            if io.KeyCode == Enum.KeyCode.Two then spinMode = not spinMode; spinAngle = 0 end
+            if io.KeyCode == Enum.KeyCode.Three then gesturePlay("come", "R") end
+            if io.KeyCode == Enum.KeyCode.Four then gesturePlay("thumb", "R") end
+            if io.KeyCode == Enum.KeyCode.Five then gesturePlay("point", "R") end
+            if io.KeyCode == Enum.KeyCode.Six then gesturePlay("fist", "R") end
+            if io.KeyCode == Enum.KeyCode.E then
+                refreshInput()
+                if Input then
+                    if S.toggleGrabMode then
+                        Input.rIndex = Input.rIndex == 1 and 0 or 1
+                        if Input.rIndex == 1 then Input.rFist = 0; Input.rThumb = 0 end
+                    else
+                        Input.rIndex = 1; Input.rFist = 0; Input.rThumb = 0
+                        grabOverride.R = true
+                        task.delay(0.2, function() grabOverride.R = false end)
+                    end
+                end
+            end
+            if io.KeyCode == Enum.KeyCode.Q then
+                refreshInput()
+                if Input then
+                    if S.toggleGrabMode then
+                        Input.lIndex = Input.lIndex == 1 and 0 or 1
+                        if Input.lIndex == 1 then Input.lFist = 0; Input.lThumb = 0 end
+                    else
+                        Input.lIndex = 1; Input.lFist = 0; Input.lThumb = 0
+                        grabOverride.L = true
+                        task.delay(0.2, function() grabOverride.L = false end)
+                    end
+                end
+            end
+        elseif io.UserInputType == Enum.UserInputType.MouseButton1 then
+            if _G.__NoVR_isWheelHand and _G.__NoVR_isWheelHand() and mouseWheelDrag then return end
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.rFist = Input.rFist == 1 and 0 or 1
+                    Input.rIndex = Input.rIndex == 1 and 0 or 1
+                else
+                    Input.rFist = 1; Input.rIndex = 1
+                    grabOverride.R = true
+                    task.delay(0.2, function() grabOverride.R = false end)
+                end
+            end
+        elseif io.UserInputType == Enum.UserInputType.MouseButton2 then
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.lFist = Input.lFist == 1 and 0 or 1
+                    Input.lIndex = Input.lIndex == 1 and 0 or 1
+                else
+                    Input.lFist = 1; Input.lIndex = 1
+                    grabOverride.L = true
+                    task.delay(0.2, function() grabOverride.L = false end)
+                end
+            end
+        end
+    end)
+
+    UIS.InputEnded:Connect(function(io)
+        if io.UserInputType == Enum.UserInputType.Keyboard then
+            keys[io.KeyCode] = false
+            if Input and io.KeyCode == Enum.KeyCode.E and not S.toggleGrabMode then Input.rIndex = 0 end
+            if Input and io.KeyCode == Enum.KeyCode.Q and not S.toggleGrabMode then Input.lIndex = 0 end
+        elseif io.UserInputType == Enum.UserInputType.MouseButton1 then
+            if Input and not S.toggleGrabMode then Input.rFist = 0; Input.rIndex = 0 end
+        elseif io.UserInputType == Enum.UserInputType.MouseButton2 then
+            if Input and not S.toggleGrabMode then Input.lFist = 0; Input.lIndex = 0 end
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(io)
+        if io.UserInputType == Enum.UserInputType.MouseWheel then
+            S.reach = math.clamp(S.reach - io.Position.Z * 0.07, 0.05, 20)
+        end
+    end)
+
+    RunService:BindToRenderStep("NoVR_Control", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        local t = os.clock()
+        frameCounter = frameCounter + 1
+
+        if recordMode then
+            if t - recordStartT > RECORD_MAX_DURATION then
+                recordMode = false
+                print(("[NoVR] 录制超时，共 %d 帧"):format(maxRecordFrame))
+                if maxRecordFrame > 0 and refreshLibraryListRef then
+                    recordCounter = recordCounter + 1
+                    table.insert(recordLibrary, {
+                        name = "录制 " .. recordCounter,
+                        frames = recordFrames,
+                        maxFrame = maxRecordFrame,
+                        duration = maxRecordFrame / 60,
+                    })
+                    if #recordLibrary > RECORD_LIBRARY_MAX then
+                        table.remove(recordLibrary, 1)
+                    end
+                    refreshLibraryListRef()
+                end
+            end
+        end
+        if playbackMode then
+            playbackFrame = playbackFrame + 1
+            if playbackFrame > maxRecordFrame then
+                playbackMode = false
+                print("[NoVR] 回放结束")
+            end
+        end
+
+        if S.look and not UIS.TouchEnabled then
+            local d = UIS:GetMouseDelta()
+            local comp = math.clamp(dt * 60, 0.25, 3)
+            targetYaw   = targetYaw   - d.X * S.sens * comp
+            targetPitch = math.clamp(targetPitch - d.Y * S.sensPitch * comp, -1.55, 1.55)
+            UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+        end
+
+        if headGyroEnabled and gyroNow then
+            if not headGyroBase then
+                headGyroBase = gyroNow
+                headGyroLastYaw = 0
+                headGyroLastPitch = 0
+            end
+            local rel = headGyroBase:Inverse() * gyroNow
+            local rx, ry, rz = rel:ToEulerAnglesYXZ()
+
+            local dPitch = rx - headGyroLastPitch
+            if dPitch > math.pi then dPitch = dPitch - math.pi * 2
+            elseif dPitch < -math.pi then dPitch = dPitch + math.pi * 2 end
+
+            local dYaw = ry - headGyroLastYaw
+            if dYaw > math.pi then dYaw = dYaw - math.pi * 2
+            elseif dYaw < -math.pi then dYaw = dYaw + math.pi * 2 end
+
+            if math.abs(dYaw) < 0.5 then
+                targetYaw = targetYaw + dYaw * S.headGyroSens
+            end
+            if math.abs(dPitch) < 0.5 then
+                targetPitch = math.clamp(targetPitch - dPitch * S.headGyroSens, -1.55, 1.55)
+            end
+
+            headGyroLastYaw = ry
+            headGyroLastPitch = rx
+        else
+            headGyroBase = nil
+            headGyroLastYaw = 0
+            headGyroLastPitch = 0
+        end
+
+        if wheelHandEnabled and WHEEL_AUTO_RETURN then
+            local dragging = _G.__NoVR_wheelDragging and _G.__NoVR_wheelDragging()
+            if not dragging then
+                local retK = 1 - math.exp(-WHEEL_RETURN_SPEED * dt)
+                for _, side in ipairs({"L", "R"}) do
+                    local off = wheelOffset[side]
+                    off.x = off.x * (1 - retK)
+                    off.y = off.y * (1 - retK)
+                    off.z = off.z * (1 - retK)
+                    local rot = wheelRot[side]
+                    rot.yaw   = rot.yaw   * (1 - retK)
+                    rot.pitch = rot.pitch * (1 - retK)
+                    rot.roll  = rot.roll  * (1 - retK)
+                end
+            end
+        end
+
+        do
+            local wKPos = 1 - math.exp(-6 * dt)
+            local wKRot = 1 - math.exp(-3.5 * dt)
+            for _, side in ipairs({"L", "R"}) do
+                local off = wheelOffset[side]
+                local oS = wheelOffsetSmooth[side]
+                oS.x = oS.x + (off.x - oS.x) * wKPos
+                oS.y = oS.y + (off.y - oS.y) * wKPos
+                oS.z = oS.z + (off.z - oS.z) * wKPos
+
+                local rot = wheelRot[side]
+                local rS = wheelRotSmooth[side]
+                rS.yaw   = rS.yaw   + (rot.yaw   - rS.yaw)   * wKRot
+                rS.pitch = rS.pitch + (rot.pitch - rS.pitch) * wKRot
+                rS.roll  = rS.roll  + (rot.roll  - rS.roll)  * wKRot
+
+                local wOff = wheelOffsetSmooth[side]
+                local wVec = Vector3.new(wOff.x, wOff.y, -wOff.z)
+                local targetPitch = wVec.z * 0.55 + wVec.y * 0.25
+                local targetYaw   = -wVec.x * 0.50
+                local targetRoll  = -wVec.x * 0.35
+                local tS = handTiltSmooth[side]
+                local tiltK = 1 - math.exp(-8 * dt)
+                tS.pitch = tS.pitch + (targetPitch - tS.pitch) * tiltK
+                tS.yaw   = tS.yaw   + (targetYaw   - tS.yaw)   * tiltK
+                tS.roll  = tS.roll  + (targetRoll  - tS.roll)  * tiltK
+            end
+
+            if wheelHandEnabled then
+                local dragging = _G.__NoVR_wheelDragging and _G.__NoVR_wheelDragging()
+                if not dragging and _G.__NoVR_wheelUi then
+                    local ui = _G.__NoVR_wheelUi
+                    local maxR = 140 * 0.5 * 0.75
+                    local halfSlider = 70 - 14
+                    for _, side in ipairs({"L", "R"}) do
+                        local oS = wheelOffsetSmooth[side]
+                        local kn = (side == "L") and ui.wheelLKnob or ui.wheelRKnob
+                        if kn then
+                            local nx = math.clamp(oS.x / WHEEL_MAX_XY, -1, 1)
+                            local ny = math.clamp(-oS.z / WHEEL_MAX_FWD, -1, 1)
+                            kn.Position = UDim2.new(0.5, nx * maxR, 0.5, ny * maxR)
+                        end
+                        local skn = (side == "L") and ui.sliderLKnob or ui.sliderRKnob
+                        if skn then
+                            local ny = math.clamp(-oS.y / WHEEL_MAX_UP, -1, 1)
+                            skn.Position = UDim2.new(0.5, 0, 0.5, ny * halfSlider)
+                        end
+                    end
+                end
+            end
+        end
+
+        local breath = math.sin(t * S.breathSpeed * math.pi * 2) * S.breathAmp
+        local swayAmp = S.swayEnabled and S.handSway or 0
+        local targetSwayL = Vector3.new(
+            naturalSway(t, 1.31) * swayAmp,
+            naturalSway(t, 2.73) * swayAmp * 0.7 + breath,
+            naturalSway(t, 4.17) * swayAmp * 0.5)
+        local targetSwayR = Vector3.new(
+            naturalSway(t, 5.39) * swayAmp,
+            naturalSway(t, 6.81) * swayAmp * 0.7 + breath,
+            naturalSway(t, 8.23) * swayAmp * 0.5)
+        local aS = 1 - math.exp(-6 * dt)
+        swayOffsetL = swayOffsetL:Lerp(targetSwayL, aS)
+        swayOffsetR = swayOffsetR:Lerp(targetSwayR, aS)
+
+        if S.gyroEnabled and gyroBase and gyroNow then
+            local rel = gyroBase:Inverse() * gyroNow
+            local rx, ry, rz = rel:ToEulerAnglesYXZ()
+            if math.abs(rx) > S.gyroAngleMax
+            or math.abs(ry) > S.gyroAngleMax
+            or math.abs(rz) > S.gyroAngleMax then
+                gyroBase = gyroNow
+                rx, ry, rz = 0, 0, 0
+            end
+            rx = math.clamp(rx, -S.gyroRotMax, S.gyroRotMax)
+            ry = math.clamp(ry, -S.gyroRotMax, S.gyroRotMax)
+            rz = math.clamp(rz, -S.gyroRotMax, S.gyroRotMax)
+
+            local rL, pL, zL = rx, ry, rz
+            local rR, pR, zR = rx, ry, rz
+            if gyroSepEnabled then
+                if selHand == "L" then rR, pR, zR = 0, 0, 0
+                elseif selHand == "R" then rL, pL, zL = 0, 0, 0 end
+            end
+
+            local rk = S.gyroRotK
+            local targetRL = CFrame.fromEulerAnglesYXZ(
+                rL * rk * S.handMirrorL,
+                pL * rk * S.handMirrorL,
+                zL * rk * S.handMirrorL)
+            local targetRR = CFrame.fromEulerAnglesYXZ(
+                rR * rk * S.handMirrorR * -1,
+                pR * rk * S.handMirrorR * -1,
+                zR * rk * S.handMirrorR * -1)
+
+            if S.swayEnabled then
+                targetRL = targetRL * CFrame.fromEulerAnglesYXZ(
+                    naturalSway(t, 10.1) * S.handRotSway,
+                    naturalSway(t, 11.3) * S.handRotSway,
+                    naturalSway(t, 12.7) * S.handRotSway)
+                targetRR = targetRR * CFrame.fromEulerAnglesYXZ(
+                    naturalSway(t, 13.1) * S.handRotSway,
+                    naturalSway(t, 14.3) * S.handRotSway,
+                    naturalSway(t, 15.7) * S.handRotSway)
+            end
+
+            local aR = 1 - math.exp(-S.gyroRotSmooth * dt)
+            rotL = rotL:Lerp(targetRL, aR)
+            rotR = rotR:Lerp(targetRR, aR)
+
+            local pk = S.gyroPosK
+            local targetGyroL = Vector3.new(
+                -pL * pk * S.handMirrorL,
+                zL * pk * S.handMirrorL * 0.6,
+                -rL * pk * 0.4)
+            local targetGyroR = Vector3.new(
+                -pR * pk * S.handMirrorR,
+                zR * pk * S.handMirrorR * 0.6,
+                -rR * pk * 0.4)
+            local maxP = S.gyroPosMax
+            if targetGyroL.Magnitude > maxP then targetGyroL = targetGyroL.Unit * maxP end
+            if targetGyroR.Magnitude > maxP then targetGyroR = targetGyroR.Unit * maxP end
+            local aP = 1 - math.exp(-S.gyroRotSmooth * dt)
+            gyroPosL = gyroPosL:Lerp(targetGyroL, aP)
+            gyroPosR = gyroPosR:Lerp(targetGyroR, aP)
+
+            if gyroSepEnabled and selHand ~= "B" then
+                if selHand == "L" then
+                    rotR = CFrame.new(); gyroPosR = Vector3.zero
+                elseif selHand == "R" then
+                    rotL = CFrame.new(); gyroPosL = Vector3.zero
+                end
+            end
+        else
+            local aR = math.min(dt * 6, 1)
+            rotL = rotL:Lerp(CFrame.new(), aR); rotR = rotR:Lerp(CFrame.new(), aR)
+            gyroPosL = gyroPosL:Lerp(Vector3.zero, aR); gyroPosR = gyroPosR:Lerp(Vector3.zero, aR)
+        end
+
+        local targetGPosL, targetGPosR = Vector3.zero, Vector3.zero
+        local targetGRotL, targetGRotR = CFrame.new(), CFrame.new()
+        if gestureCur then
+            gestureT = gestureT + dt
+            if gestureT >= gestureCur.dur then
+                gestureCur = nil; gestureT = 0
+            else
+                local gp, gr = sampleGesture(gestureCur, gestureT)
+                local h = gestureHand
+                if h == "L" then
+                    targetGPosL = Vector3.new(-gp.X, gp.Y, gp.Z); targetGRotL = gr
+                elseif h == "R" then
+                    targetGPosR = gp; targetGRotR = gr
+                elseif h == "B" then
+                    targetGPosL = Vector3.new(-gp.X, gp.Y, gp.Z); targetGRotL = gr
+                    targetGPosR = gp; targetGRotR = gr
+                end
+            end
+        end
+        local aG = 1 - math.exp(-S.gestureBlend * dt)
+        gesturePosL = gesturePosL:Lerp(targetGPosL, aG)
+        gesturePosR = gesturePosR:Lerp(targetGPosR, aG)
+        gestureRotL = gestureRotL:Lerp(targetGRotL, aG)
+        gestureRotR = gestureRotR:Lerp(targetGRotR, aG)
+        if spinMode then
+            spinAngle = spinAngle + dt * 35
+            local spinCF = CFrame.fromEulerAnglesXYZ(0, 0, spinAngle)
+            rotL = rotL * spinCF; rotR = rotR * spinCF
+        end
+        local k = 1 - math.exp(-S.smooth * dt)
+        local prevYaw = yaw
+        local prevPitch = pitch
+        yaw   = yaw   + (targetYaw   - yaw)   * k
+        pitch = pitch + (targetPitch - pitch) * k
+        if autoTiltEnabled then
+            local yawVel = (yaw - prevYaw) / math.max(dt, 1/240)
+            local autoRoll = math.clamp(yawVel * S.rollK, -S.rollMax, S.rollMax)
+            local rollSpeed = (math.abs(autoRoll) > 0.005) and S.rollSmooth or S.rollReturnSmooth
+            roll = roll + (autoRoll - roll) * (1 - math.exp(-rollSpeed * dt))
+            local pitchVel = (pitch - prevPitch) / math.max(dt, 1/240)
+            local autoPitchTilt = math.clamp(pitchVel * S.pitchTiltK, -S.pitchTiltMax, S.pitchTiltMax)
+            local pitchSpeed = (math.abs(autoPitchTilt) > 0.005) and S.pitchTiltSmooth or S.pitchTiltReturnSmooth
+            pitchTilt = pitchTilt + (autoPitchTilt - pitchTilt) * (1 - math.exp(-pitchSpeed * dt))
+        else
+            roll = roll * (1 - math.exp(-4 * dt))
+            pitchTilt = pitchTilt * (1 - math.exp(-4 * dt))
+        end
+        local tiltK = 1 - math.exp(-9 * dt)
+        manualRoll  = manualRoll  + (headTiltTargetRoll  - manualRoll)  * tiltK
+        manualPitch = manualPitch + (headTiltTargetPitch - manualPitch) * tiltK
+        local finalRoll = roll + manualRoll
+        local finalPitchOffset = pitchTilt + manualPitch
+        local headSwayYawV, headSwayPitchV = 0, 0
+        local headSwayPosV = Vector3.zero
+        if S.swayEnabled then
+            headSwayYawV   = (slowDrift(t, 20.1) * 0.7 + naturalSway(t, 20.1) * 0.3) * S.headSwayYaw
+            headSwayPitchV = (slowDrift(t, 33.7) * 0.7 + naturalSway(t, 33.7) * 0.3) * S.headSwayPitch
+            headSwayPosV   = Vector3.new(
+                slowDrift(t, 22.7) * S.headSwayPos,
+                slowDrift(t, 23.9) * S.headSwayPos * 1.2 + breathDrift(t, 40.3) * S.headSwayPos * 0.8,
+                slowDrift(t, 25.1) * S.headSwayPos * 0.5)
+        end
+        local breathHead = breath * S.breathHeadK
+        headSwayPosV = headSwayPosV + Vector3.new(0, breathHead, 0)
+        headSwayPitchV = headSwayPitchV + breathHead * 0.4
+        local finalPitch = pitch + headSwayPitchV + finalPitchOffset
+        local finalYaw = yaw + headSwayYawV
+        local rot = CFrame.fromEulerAnglesYXZ(finalPitch, finalYaw, finalRoll)
+        local rotDelta = prevRotForInertia:Inverse() * rot
+        local idy, idp, _ = rotDelta:ToEulerAnglesYXZ()
+        handInertiaVec = handInertiaVec + Vector3.new(idy * S.handInertia, -idp * S.handInertia, 0)
+        handInertiaVec = handInertiaVec * math.exp(-S.handInertiaDecay * dt)
+        if handInertiaVec.Magnitude > 0.35 then handInertiaVec = handInertiaVec.Unit * 0.35 end
+        prevRotForInertia = rot
+        local hs = cam.HeadScale
+        if type(hs) ~= "number" or hs <= 1 then hs = S.scale * 6 end
+        local spd = (10 + S.scale * 4) * hs * S.moveK * S.speedMult
+        local mv = Vector3.zero
+        if keys[Enum.KeyCode.W] then mv += Vector3.new(0,0,-1) end
+        if keys[Enum.KeyCode.S] then mv += Vector3.new(0,0, 1) end
+        if keys[Enum.KeyCode.A] then mv += Vector3.new(-1,0,0) end
+        if keys[Enum.KeyCode.D] then mv += Vector3.new( 1,0,0) end
+        if keys[Enum.KeyCode.Space] then mv += Vector3.new(0, 1,0) end
+        if keys[Enum.KeyCode.LeftShift] then mv += Vector3.new(0,-1,0) end
+        local targetVel = Vector3.zero
+        if mv.Magnitude > 0 then targetVel = (rot * mv.Unit) * spd end
+        moveVel = targetVel
+        camPos = camPos + moveVel * dt
+        _G.__NoVR_camPos = camPos
+        cam.CameraType = Enum.CameraType.Scriptable
+        cam.CFrame = CFrame.new(camPos + headSwayPosV) * rot
+
+        if freeCamMode and freeCamBodyCFrame and _G.__NoVR_rig then
+            local vrHead = _G.__NoVR_rig:FindFirstChild("VRHead")
+            if vrHead then
+                pcall(function()
+                    vrHead.CFrame = freeCamBodyCFrame
+                end)
+            end
+        end
+
+        if Input then
+            Input.directionLateral = Vector2.zero
+            Input.directionVertical = 0
+            Input.turnDirection = 0
+        end
+
+        if recStatusRef then
+            if recordMode then
+                recStatusRef.Visible = true
+                recStatusRef.BackgroundColor3 = Color3.fromRGB(200, 30, 30)
+                recStatusRef.Text = ("● 录制 %.1fs"):format(t - recordStartT)
+            elseif playbackMode then
+                recStatusRef.Visible = true
+                recStatusRef.BackgroundColor3 = Color3.fromRGB(30, 100, 200)
+                recStatusRef.Text = ("▶ 回放 %.1f/%.1f"):format(playbackFrame / 60, maxRecordFrame / 60)
+            elseif freeCamMode then
+                recStatusRef.Visible = true
+                recStatusRef.BackgroundColor3 = Color3.fromRGB(120, 80, 200)
+                recStatusRef.Text = "👁 自由头部视角"
+            else
+                recStatusRef.Visible = false
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                if cam then
+                    local tip = cam:FindFirstChild("VR_TIP")
+                    if tip then tip:Destroy() end
+                end
+            end)
+            local CoreGui
+            pcall(function() CoreGui = game:GetService("CoreGui") end)
+            local containers = {}
+            if CoreGui then table.insert(containers, CoreGui) end
+            local pg = lp:FindFirstChild("PlayerGui")
+            if pg then table.insert(containers, pg) end
+            local c2 = workspace.CurrentCamera
+            if c2 then table.insert(containers, c2) end
+            for _, container in ipairs(containers) do
+                for _, child in ipairs(container:GetChildren()) do
+                    if (child:IsA("ScreenGui") or child:IsA("BillboardGui")) and
+                       child.Name ~= "NoVR_HUD" and child.Name ~= "NoVR_MobileControls" and
+                       child.Name ~= "NoVR_Greeting" and child.Name ~= "NoVR_About" and
+                       child.Name ~= "NoVR_WheelHand" then
+                        local n = child.Name:lower()
+                        if n:match("vr") or n:match("bottom") or n:match("panel") or n:match("tutorial") then
+                            pcall(function() child.Enabled = false end)
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        if UIS.TouchEnabled then return end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "NoVR_HUD"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+        gui.Parent = lp:WaitForChild("PlayerGui")
+        local followBtn = Instance.new("TextButton")
+        followBtn.Name = "FollowToggle"
+        followBtn.Size = UDim2.fromOffset(120, 24)
+        followBtn.Position = UDim2.new(1, -10, 0, 10)
+        followBtn.AnchorPoint = Vector2.new(1, 0)
+        followBtn.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+        followBtn.BackgroundTransparency = 0.5
+        followBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        followBtn.Text = "跟随头部：开"
+        followBtn.Font = Enum.Font.SourceSansBold
+        followBtn.TextSize = 12
+        followBtn.AutoButtonColor = false
+        followBtn.BorderSizePixel = 0
+        followBtn.Parent = gui
+        Instance.new("UICorner", followBtn).CornerRadius = UDim.new(0, 6)
+        local fs = Instance.new("UIStroke", followBtn)
+        fs.Color = Color3.fromRGB(255,255,255); fs.Transparency = 0.3; fs.Thickness = 1.4
+        followBtn.MouseButton1Click:Connect(function()
+            headFollowEnabled = not headFollowEnabled
+            followBtn.Text = headFollowEnabled and "跟随头部：开" or "跟随头部：关"
+            handAnchorRot.L = nil
+            handAnchorRot.R = nil
+            if headFollowEnabled and freeCamMode then
+                freeCamMode = false
+                freeCamBodyCFrame = nil
+                if freeCamBtnRef then freeCamBtnRef.Text = "自由头部视角" end
+            end
+        end)
+
+        local wheelBtn = Instance.new("TextButton")
+        wheelBtn.Name = "WheelHandToggle"
+        wheelBtn.Size = UDim2.fromOffset(120, 24)
+        wheelBtn.Position = UDim2.new(1, -10, 0, 40)
+        wheelBtn.AnchorPoint = Vector2.new(1, 0)
+        wheelBtn.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+        wheelBtn.BackgroundTransparency = 0.5
+        wheelBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        wheelBtn.Text = "轮盘手：关"
+        wheelBtn.Font = Enum.Font.SourceSansBold
+        wheelBtn.TextSize = 12
+        wheelBtn.AutoButtonColor = false
+        wheelBtn.BorderSizePixel = 0
+        wheelBtn.Parent = gui
+        Instance.new("UICorner", wheelBtn).CornerRadius = UDim.new(0, 6)
+        local wbs = Instance.new("UIStroke", wheelBtn)
+        wbs.Color = Color3.fromRGB(255,255,255); wbs.Transparency = 0.3; wbs.Thickness = 1.4
+        wheelBtn.MouseButton1Click:Connect(function()
+            local now = not _G.__NoVR_isWheelHand()
+            _G.__NoVR_setWheelHand(now)
+            wheelBtn.Text = now and "轮盘手：开" or "轮盘手：关"
+        end)
+
+        local lbl = Instance.new("TextLabel", gui)
+        lbl.AnchorPoint = Vector2.new(1, 0)
+        lbl.Position = UDim2.new(1, -10, 0, 74)
+        lbl.Size = UDim2.new(0, 300, 0, 240)
+        lbl.BackgroundColor3 = Color3.fromRGB(0,0,0); lbl.BackgroundTransparency = 0.45
+        lbl.TextColor3 = Color3.fromRGB(255,255,255)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.TextYAlignment = Enum.TextYAlignment.Top
+        lbl.Font = Enum.Font.Code; lbl.TextSize = 12
+        RunService.Heartbeat:Connect(function()
+            local vrNow = false
+            pcall(function() vrNow = VRService.VREnabled end)
+            lbl.Text = ("[VR Hands :: No-VR]\nHook: %s | VREnabled: %s\nInput: %s | VRM: %s\nWASD - fly | LMB/RMB - grab\n1 - 挥拳 | 3/4/5/6 - 手势 | 2 - 手转")
+            :format(tostring(HOOK_OK), tostring(vrNow), tostring(Input ~= nil), tostring(vrm ~= nil))
+        end)
+    end)
+
+    pcall(function()
+        if not UIS.TouchEnabled then return end
+        local mobileGui = Instance.new("ScreenGui")
+        mobileGui.Name = "NoVR_MobileControls"
+        mobileGui.ResetOnSpawn = false
+        mobileGui.IgnoreGuiInset = true
+        mobileGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        mobileGui.Parent = lp:WaitForChild("PlayerGui")
+
+        local activeTouchBtn = {}
+
+        local function createBtn(parent, name, pos, size, text, textSize)
+            textSize = textSize or 13
+            local btn = Instance.new("TextButton")
+            btn.Name = name; btn.Position = pos; btn.Size = size
+            btn.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+            btn.BackgroundTransparency = 0.35
+            btn.TextColor3 = Color3.fromRGB(240, 242, 250)
+            btn.Text = text
+            btn.Font = Enum.Font.GothamSemibold
+            btn.TextSize = textSize
+            btn.AutoButtonColor = false
+            btn.BorderSizePixel = 0
+            btn.Parent = parent
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
+            local stroke = Instance.new("UIStroke", btn)
+            stroke.Color = Color3.fromRGB(230, 230, 240)
+            stroke.Transparency = 0.55
+            stroke.Thickness = 1.2
+            stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            return btn
+        end
+
+        local function applyStroke(btn, thickness, transparency)
+            local old = btn:FindFirstChildOfClass("UIStroke")
+            if old then old:Destroy() end
+            local s = Instance.new("UIStroke", btn)
+            s.Color = Color3.fromRGB(230, 230, 240)
+            s.Thickness = thickness or 2
+            s.Transparency = transparency or 0.15
+            s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            return btn
+        end
+
+        local function bindTap(btn, onTap)
+            local baseSize = btn.Size
+            btn.InputBegan:Connect(function(i)
+                if i.UserInputType ~= Enum.UserInputType.Touch then return end
+                if activeTouchBtn[i] then return end
+                activeTouchBtn[i] = {
+                    btn = btn,
+                    onTap = onTap,
+                    startPos = i.Position,
+                    moved = false,
+                    baseSize = baseSize,
+                }
+                TweenService:Create(btn, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                    Size = UDim2.new(baseSize.X.Scale, baseSize.X.Offset - 4,
+                                     baseSize.Y.Scale, baseSize.Y.Offset - 4)
+                }):Play()
+            end)
+        end
+
+        UIS.TouchMoved:Connect(function(i)
+            local rec = activeTouchBtn[i]
+            if not rec or rec.moved then return end
+
+            if (i.Position - rec.startPos).Magnitude > 15 then
+                rec.moved = true
+                TweenService:Create(rec.btn, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                    Size = rec.baseSize
+                }):Play()
+                return
+            end
+
+            local ap = rec.btn.AbsolutePosition
+            local as = rec.btn.AbsoluteSize
+            if i.Position.X < ap.X - 8 or i.Position.X > ap.X + as.X + 8
+            or i.Position.Y < ap.Y - 8 or i.Position.Y > ap.Y + as.Y + 8 then
+                rec.moved = true
+                TweenService:Create(rec.btn, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                    Size = rec.baseSize
+                }):Play()
+            end
+        end)
+
+        UIS.TouchEnded:Connect(function(i)
+            local rec = activeTouchBtn[i]
+            if not rec then return end
+            TweenService:Create(rec.btn, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Size = rec.baseSize
+            }):Play()
+            if not rec.moved then
+                local ok, err = pcall(rec.onTap)
+                if not ok then warn("[NoVR] onTap error: " .. tostring(err)) end
+            end
+            activeTouchBtn[i] = nil
+        end)
+
+        local function makeHold(btn, onDown, onUp)
+            local active = false
+            btn.InputBegan:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch then
+                    active = true
+                    if onDown then onDown() end
+                end
+            end)
+            btn.InputEnded:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch then
+                    active = false
+                    if onUp then onUp() end
+                end
+            end)
+            btn.InputChanged:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch and active then
+                    local ap = btn.AbsolutePosition
+                    local as = btn.AbsoluteSize
+                    if not (i.Position.X >= ap.X - 30 and i.Position.X <= ap.X + as.X + 30
+                    and i.Position.Y >= ap.Y - 30 and i.Position.Y <= ap.Y + as.Y + 30) then
+                        active = false
+                        if onUp then onUp() end
+                    end
+                end
+            end)
+        end
+
+        local btnW, btnGap, btnH, startX = 48, 3, 22, -6
+
+        local scalePanel = Instance.new("Frame")
+        scalePanel.AnchorPoint = Vector2.new(1, 0)
+        scalePanel.Position = UDim2.new(1, -10, 0, 32)
+        scalePanel.Size = UDim2.fromOffset(180, 88)
+        scalePanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        scalePanel.BackgroundTransparency = 0.35
+        scalePanel.BorderSizePixel = 0
+        scalePanel.Visible = false
+        scalePanel.ZIndex = 5
+        scalePanel.Parent = mobileGui
+        Instance.new("UICorner", scalePanel).CornerRadius = UDim.new(0, 14)
+        local scaleStroke = Instance.new("UIStroke", scalePanel)
+        scaleStroke.Color = Color3.fromRGB(230, 230, 240)
+        scaleStroke.Transparency = 0.5
+        scaleStroke.Thickness = 1.3
+
+        local scaleBox = Instance.new("TextBox")
+        scaleBox.Size = UDim2.new(1, -16, 0, 30)
+        scaleBox.Position = UDim2.new(0, 8, 0, 8)
+        scaleBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+        scaleBox.BackgroundTransparency = 0.2
+        scaleBox.Text = "100"
+        scaleBox.PlaceholderText = "10 ~ 100"
+        scaleBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        scaleBox.Font = Enum.Font.SourceSans
+        scaleBox.TextSize = 13
+        scaleBox.BorderSizePixel = 0
+        scaleBox.ClearTextOnFocus = false
+        scaleBox.ZIndex = 6
+        scaleBox.Parent = scalePanel
+        Instance.new("UICorner", scaleBox).CornerRadius = UDim.new(0, 5)
+
+        local scaleOk = Instance.new("TextButton")
+        scaleOk.Size = UDim2.new(1, -16, 0, 28)
+        scaleOk.Position = UDim2.new(0, 8, 0, 46)
+        scaleOk.BackgroundColor3 = Color3.fromRGB(30, 90, 200)
+        scaleOk.BackgroundTransparency = 0.15
+        scaleOk.Text = "应用"
+        scaleOk.TextColor3 = Color3.fromRGB(255, 255, 255)
+        scaleOk.Font = Enum.Font.SourceSansBold
+        scaleOk.TextSize = 12
+        scaleOk.BorderSizePixel = 0
+        scaleOk.AutoButtonColor = false
+        scaleOk.ZIndex = 6
+        scaleOk.Parent = scalePanel
+        Instance.new("UICorner", scaleOk).CornerRadius = UDim.new(0, 5)
+        local scaleOkStroke = Instance.new("UIStroke", scaleOk)
+        scaleOkStroke.Color = Color3.fromRGB(255,255,255)
+        scaleOkStroke.Transparency = 0.4
+        scaleOkStroke.Thickness = 1.2
+
+        local scaleCooling = false
+        local scaleRem = 0
+        local scaleSetEvent = nil
+
+        task.spawn(function()
+            local RS = game:GetService("ReplicatedStorage")
+            for _ = 1, 20 do
+                local COM = RS:FindFirstChild("COM")
+                local Data = COM and COM:FindFirstChild("Data")
+                local S2 = Data and Data:FindFirstChild("Set")
+                if S2 then scaleSetEvent = S2; break end
+                task.wait(0.5)
+            end
+        end)
+
+        recStatusRef = Instance.new("TextLabel")
+        recStatusRef.Size = UDim2.fromOffset(180, 26)
+        recStatusRef.Position = UDim2.new(0.5, -90, 0, 60)
+        recStatusRef.BackgroundColor3 = Color3.fromRGB(200, 30, 30)
+        recStatusRef.BackgroundTransparency = 0.2
+        recStatusRef.TextColor3 = Color3.fromRGB(255, 255, 255)
+        recStatusRef.Font = Enum.Font.GothamBold
+        recStatusRef.TextSize = 13
+        recStatusRef.Text = "● 录制中"
+        recStatusRef.Visible = false
+        recStatusRef.ZIndex = 100
+        recStatusRef.Parent = mobileGui
+        Instance.new("UICorner", recStatusRef).CornerRadius = UDim.new(0, 8)
+
+        local themePanel = Instance.new("Frame")
+        themePanel.Size = UDim2.fromOffset(240, 240)
+        themePanel.AnchorPoint = Vector2.new(0.5, 0.5)
+        themePanel.Position = UDim2.fromScale(0.5, 0.5)
+        themePanel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        themePanel.BackgroundTransparency = 0.05
+        themePanel.BorderSizePixel = 0
+        themePanel.Visible = false
+        themePanel.ZIndex = 100
+        themePanel.Active = true
+        themePanel.Parent = mobileGui
+        Instance.new("UICorner", themePanel).CornerRadius = UDim.new(1, 0)
+        local themePanelStroke = Instance.new("UIStroke", themePanel)
+        themePanelStroke.Color = Color3.fromRGB(255, 255, 255)
+        themePanelStroke.Transparency = 0.2
+        themePanelStroke.Thickness = 2
+
+        for i = 1, 36 do
+            local angle = (i - 1) / 36 * math.pi * 2
+            local hue = (i - 1) / 36
+            local color = Color3.fromHSV(hue, 1, 1)
+            local dot = Instance.new("Frame")
+            dot.Size = UDim2.fromOffset(26, 26)
+            dot.AnchorPoint = Vector2.new(0.5, 0.5)
+            dot.Position = UDim2.new(0.5, math.cos(angle) * 96, 0.5, math.sin(angle) * 96)
+            dot.BackgroundColor3 = color
+            dot.BorderSizePixel = 0
+            dot.ZIndex = 100
+            dot.Parent = themePanel
+            Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+        end
+
+        for i = 1, 20 do
+            local tt = i / 20
+            local ring = Instance.new("Frame")
+            ring.Size = UDim2.fromScale(tt, tt)
+            ring.AnchorPoint = Vector2.new(0.5, 0.5)
+            ring.Position = UDim2.fromScale(0.5, 0.5)
+            ring.BackgroundColor3 = Color3.new(1, 1, 1)
+            ring.BackgroundTransparency = 0.05 + tt * 0.95
+            ring.BorderSizePixel = 0
+            ring.ZIndex = 100 + i
+            ring.Parent = themePanel
+            Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
+        end
+
+        local themeKnob = Instance.new("Frame")
+        themeKnob.Name = "ThemeKnob"
+        themeKnob.Size = UDim2.fromOffset(28, 28)
+        themeKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        themeKnob.Position = UDim2.new(0.5, 96, 0.5, 0)
+        themeKnob.BackgroundColor3 = Color3.fromHSV(0, 1, 1)
+        themeKnob.BorderSizePixel = 0
+        themeKnob.ZIndex = 300
+        themeKnob.Parent = themePanel
+        Instance.new("UICorner", themeKnob).CornerRadius = UDim.new(1, 0)
+        local themeKnobStroke = Instance.new("UIStroke", themeKnob)
+        themeKnobStroke.Color = Color3.fromRGB(255, 255, 255)
+        themeKnobStroke.Thickness = 3
+
+        local themeTargetsMain = nil
+        local themeTargetsWheel = nil
+
+        local function collectThemeTargets()
+            themeTargetsMain = {}
+            for _, obj in ipairs(mobileGui:GetDescendants()) do
+                local insideTheme = false
+                local p = obj.Parent
+                while p do
+                    if p == themePanel then insideTheme = true; break end
+                    p = p.Parent
+                end
+                if not insideTheme then
+                    if obj:IsA("TextButton") or obj:IsA("TextLabel") or obj:IsA("Frame") or obj:IsA("TextBox") then
+                        table.insert(themeTargetsMain, obj)
+                    end
+                end
+            end
+
+            themeTargetsWheel = {}
+            local wg = _G.__NoVR_wheelGui
+            if wg then
+                for _, obj in ipairs(wg:GetDescendants()) do
+                    if obj.Name == "WheelBg" or obj.Name == "SliderBg"
+                       or obj:IsA("TextLabel") then
+                        table.insert(themeTargetsWheel, obj)
+                    end
+                end
+            end
+        end
+
+        local function applyTheme()
+            local ap = themePanel.AbsolutePosition
+            local as = themePanel.AbsoluteSize
+            local cx, cy = ap.X + as.X * 0.5, ap.Y + as.Y * 0.5
+            local kp = themeKnob.AbsolutePosition
+            local ks = themeKnob.AbsoluteSize
+            local kx, ky = kp.X + ks.X * 0.5, kp.Y + ks.Y * 0.5
+            local dx, dy = kx - cx, ky - cy
+            local r = math.sqrt(dx * dx + dy * dy)
+            local maxR = as.X * 0.5
+            local sat = math.clamp(r / maxR, 0, 1)
+            local angle = math.atan2(dy, dx)
+            local hue = (angle / (math.pi * 2)) % 1
+            if hue < 0 then hue = hue + 1 end
+
+            local bgColor     = Color3.fromHSV(hue, sat * 0.55, 0.16)
+            local strokeColor = Color3.fromHSV(hue, sat, 0.95)
+            local textColor   = Color3.fromHSV(hue, math.min(sat * 0.25, 0.25), 1)
+
+            themeKnob.BackgroundColor3 = Color3.fromHSV(hue, sat, 1)
+
+            if not themeTargetsMain then collectThemeTargets() end
+
+            for _, obj in ipairs(themeTargetsMain) do
+                if obj:IsA("TextButton") or obj:IsA("TextLabel") then
+                    if obj.BackgroundTransparency < 0.99 then
+                        obj.BackgroundColor3 = bgColor
+                    end
+                    obj.TextColor3 = textColor
+                    local s = obj:FindFirstChildOfClass("UIStroke")
+                    if s then s.Color = strokeColor end
+                elseif obj:IsA("Frame") or obj:IsA("TextBox") then
+                    if obj.BackgroundTransparency < 0.99 then
+                        obj.BackgroundColor3 = bgColor
+                    end
+                    if obj:IsA("TextBox") then obj.TextColor3 = textColor end
+                end
+            end
+
+            for _, obj in ipairs(themeTargetsWheel) do
+                if obj.Name == "WheelBg" or obj.Name == "SliderBg" then
+                    obj.BackgroundColor3 = bgColor
+                    local s = obj:FindFirstChildOfClass("UIStroke")
+                    if s then s.Color = strokeColor end
+                elseif obj:IsA("TextLabel") then
+                    obj.TextColor3 = textColor
+                end
+            end
+        end
+
+        local themeDirty = false
+        local themeScheduled = false
+        local function scheduleApplyTheme()
+            themeDirty = true
+            if themeScheduled then return end
+            themeScheduled = true
+            task.spawn(function()
+                while themeDirty do
+                    themeDirty = false
+                    applyTheme()
+                    task.wait()
+                end
+                themeScheduled = false
+            end)
+        end
+
+        local themeTouch = nil
+        local function updateThemeKnob(pos)
+            local ap = themePanel.AbsolutePosition
+            local as = themePanel.AbsoluteSize
+            local cx, cy = ap.X + as.X * 0.5, ap.Y + as.Y * 0.5
+            local maxR = as.X * 0.5 - 16
+            local dx = pos.X - cx
+            local dy = pos.Y - cy
+            local r = math.sqrt(dx * dx + dy * dy)
+            if r > maxR then
+                dx, dy = dx / r * maxR, dy / r * maxR
+            end
+            themeKnob.Position = UDim2.new(0.5, dx, 0.5, dy)
+            scheduleApplyTheme()
+        end
+
+        themePanel.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                themeTouch = input
+                updateThemeKnob(input.Position)
+            end
+        end)
+        themePanel.InputChanged:Connect(function(input)
+            if input == themeTouch then
+                updateThemeKnob(input.Position)
+            end
+        end)
+        themePanel.InputEnded:Connect(function(input)
+            if input == themeTouch then
+                themeTouch = nil
+            end
+        end)
+
+        local libraryPanel = Instance.new("Frame")
+        libraryPanel.Size = UDim2.fromScale(0.72, 0.62)
+        libraryPanel.Position = UDim2.fromScale(0.5, 0.5)
+        libraryPanel.AnchorPoint = Vector2.new(0.5, 0.5)
+        libraryPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        libraryPanel.BackgroundTransparency = 0.1
+        libraryPanel.BorderSizePixel = 0
+        libraryPanel.Visible = false
+        libraryPanel.ZIndex = 250
+        libraryPanel.Active = true
+        libraryPanel.Parent = mobileGui
+        Instance.new("UICorner", libraryPanel).CornerRadius = UDim.new(0, 14)
+
+        local libraryStroke = Instance.new("UIStroke", libraryPanel)
+        libraryStroke.Color = Color3.fromRGB(230, 230, 240)
+        libraryStroke.Transparency = 0.4
+        libraryStroke.Thickness = 1.5
+
+        local libraryTitle = Instance.new("TextLabel", libraryPanel)
+        libraryTitle.Size = UDim2.new(1, -100, 0, 32)
+        libraryTitle.Position = UDim2.new(0, 16, 0, 12)
+        libraryTitle.BackgroundTransparency = 1
+        libraryTitle.Text = "录制库"
+        libraryTitle.TextColor3 = Color3.fromRGB(240, 242, 250)
+        libraryTitle.TextXAlignment = Enum.TextXAlignment.Left
+        libraryTitle.Font = Enum.Font.GothamBold
+        libraryTitle.TextSize = 16
+
+        local libraryCount = Instance.new("TextLabel", libraryPanel)
+        libraryCount.Size = UDim2.new(0, 80, 0, 32)
+        libraryCount.Position = UDim2.new(1, -96, 0, 12)
+        libraryCount.BackgroundTransparency = 1
+        libraryCount.Text = "0 / 100"
+        libraryCount.TextColor3 = Color3.fromRGB(160, 160, 160)
+        libraryCount.TextXAlignment = Enum.TextXAlignment.Right
+        libraryCount.Font = Enum.Font.Gotham
+        libraryCount.TextSize = 13
+
+        local libraryClose = createBtn(libraryPanel, "LibClose",
+            UDim2.new(1, -46, 0, 12), UDim2.fromOffset(34, 30), "✕", 14)
+        libraryClose.AnchorPoint = Vector2.new(1, 0)
+
+        local libraryScroll = Instance.new("ScrollingFrame", libraryPanel)
+        libraryScroll.Size = UDim2.new(1, -24, 1, -96)
+        libraryScroll.Position = UDim2.new(0, 12, 0, 52)
+        libraryScroll.BackgroundTransparency = 1
+        libraryScroll.BorderSizePixel = 0
+        libraryScroll.ScrollBarThickness = 3
+        libraryScroll.ScrollBarImageColor3 = Color3.fromRGB(200, 210, 235)
+        libraryScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        libraryScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        libraryScroll.ZIndex = 251
+
+        local libraryLayout = Instance.new("UIListLayout", libraryScroll)
+        libraryLayout.Padding = UDim.new(0, 6)
+        libraryLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        local libraryClearBtn = createBtn(libraryPanel, "LibClear",
+            UDim2.new(0, 12, 1, -38), UDim2.new(1, -24, 0, 28), "清空全部", 13)
+        libraryClearBtn.AnchorPoint = Vector2.new(0, 0)
+        libraryClearBtn.ZIndex = 252
+
+        refreshLibraryListRef = function()
+            for _, ch in ipairs(libraryScroll:GetChildren()) do
+                if ch:IsA("Frame") or ch:IsA("TextLabel") then
+                    ch:Destroy()
+                end
+            end
+
+            libraryCount.Text = ("%d / 100"):format(#recordLibrary)
+
+            if #recordLibrary == 0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size = UDim2.new(1, 0, 0, 100)
+                empty.BackgroundTransparency = 1
+                empty.Text = "还没有录制\n点「录手」开始录制"
+                empty.TextColor3 = Color3.fromRGB(140, 140, 140)
+                empty.Font = Enum.Font.Gotham
+                empty.TextSize = 13
+                empty.LayoutOrder = 1
+                empty.ZIndex = 252
+                empty.Parent = libraryScroll
+                return
+            end
+
+            for idx, entry in ipairs(recordLibrary) do
+                local row = Instance.new("Frame")
+                row.Size = UDim2.new(1, -8, 0, 52)
+                row.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+                row.BackgroundTransparency = 0.92
+                row.BorderSizePixel = 0
+                row.LayoutOrder = idx
+                row.ZIndex = 252
+                row.Parent = libraryScroll
+                Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+                local rowStroke = Instance.new("UIStroke", row)
+                rowStroke.Color = Color3.fromRGB(230, 230, 240)
+                rowStroke.Transparency = 0.75
+                rowStroke.Thickness = 1
+
+                local numBadge = Instance.new("Frame", row)
+                numBadge.Size = UDim2.fromOffset(34, 34)
+                numBadge.Position = UDim2.new(0, 10, 0.5, -17)
+                numBadge.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+                numBadge.BorderSizePixel = 0
+                numBadge.ZIndex = 253
+                Instance.new("UICorner", numBadge).CornerRadius = UDim.new(0, 8)
+
+                local numLbl = Instance.new("TextLabel", numBadge)
+                numLbl.Size = UDim2.fromScale(1, 1)
+                numLbl.BackgroundTransparency = 1
+                numLbl.Text = tostring(idx)
+                numLbl.TextColor3 = Color3.fromRGB(0, 0, 0)
+                numLbl.Font = Enum.Font.GothamBold
+                numLbl.TextSize = 14
+                numLbl.ZIndex = 254
+
+                local nameLbl = Instance.new("TextLabel", row)
+                nameLbl.Size = UDim2.new(1, -230, 0, 18)
+                nameLbl.Position = UDim2.new(0, 54, 0, 9)
+                nameLbl.BackgroundTransparency = 1
+                nameLbl.Text = entry.name
+                nameLbl.TextColor3 = Color3.fromRGB(240, 242, 250)
+                nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+                nameLbl.Font = Enum.Font.GothamBold
+                nameLbl.TextSize = 13
+                nameLbl.ZIndex = 253
+
+                local subLbl = Instance.new("TextLabel", row)
+                subLbl.Size = UDim2.new(1, -230, 0, 16)
+                subLbl.Position = UDim2.new(0, 54, 0, 27)
+                subLbl.BackgroundTransparency = 1
+                subLbl.Text = ("%.1fs  ·  %d 帧"):format(entry.duration, entry.maxFrame)
+                subLbl.TextColor3 = Color3.fromRGB(160, 160, 160)
+                subLbl.TextXAlignment = Enum.TextXAlignment.Left
+                subLbl.Font = Enum.Font.Gotham
+                subLbl.TextSize = 11
+                subLbl.ZIndex = 253
+
+                local playBtn = createBtn(row, "LibPlay",
+                    UDim2.new(1, -158, 0.5, -14), UDim2.fromOffset(70, 28), "回放", 12)
+                playBtn.AnchorPoint = Vector2.new(0, 0)
+                playBtn.ZIndex = 254
+                playBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+                playBtn.BackgroundTransparency = 0.1
+                playBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                local ps = playBtn:FindFirstChildOfClass("UIStroke")
+                if ps then ps.Color = Color3.fromRGB(255, 255, 255); ps.Transparency = 0.3 end
+
+                local delBtn = createBtn(row, "LibDel",
+                    UDim2.new(1, -80, 0.5, -14), UDim2.fromOffset(70, 28), "删除", 12)
+                delBtn.AnchorPoint = Vector2.new(0, 0)
+                delBtn.ZIndex = 254
+                delBtn.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                delBtn.BackgroundTransparency = 0.2
+                delBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+
+                bindTap(playBtn, function()
+                    recordFrames = entry.frames
+                    maxRecordFrame = entry.maxFrame
+                    playbackFrame = 1
+                    playbackMode = true
+                    if recordMode then
+                        recordMode = false
+                        if recordBtnRef then recordBtnRef.Text = "录手" end
+                    end
+                    libraryPanel.Visible = false
+                end)
+
+                bindTap(delBtn, function()
+                    for i, e in ipairs(recordLibrary) do
+                        if e == entry then
+                            table.remove(recordLibrary, i)
+                            break
+                        end
+                    end
+                    refreshLibraryListRef()
+                end)
+            end
+        end
+
+        bindTap(libraryClose, function()
+            libraryPanel.Visible = false
+        end)
+
+        bindTap(libraryClearBtn, function()
+            recordLibrary = {}
+            recordCounter = 0
+            refreshLibraryListRef()
+        end)
+
+        libraryPanelRef = libraryPanel
+
+        local function topBtn(idx, name, text)
+            local b = createBtn(mobileGui, name,
+                UDim2.new(1, startX - (btnW + btnGap) * (idx - 1), 0.02, 0),
+                UDim2.fromOffset(btnW, btnH), text, 9)
+            b.AnchorPoint = Vector2.new(1, 0)
+            return b
+        end
+
+        local toggleUIBtn   = topBtn(1, "ToggleUI",   "隐藏")
+        local tiltToggleBtn = topBtn(2, "TiltToggle", "侧倾")
+        local funcToggleBtn = topBtn(3, "FuncToggle", "功能")
+        local infoToggleBtn = topBtn(4, "InfoToggle", "参数")
+        local scaleBtnM     = topBtn(5, "ScaleBtn",   "体型")
+        local followBtnM    = topBtn(6, "FollowM",    "跟头")
+        local wheelBtnM     = topBtn(7, "WheelBtnM",  "轮盘")
+        local headGyroBtnM  = topBtn(8, "HeadGyroBtn","头陀")
+        local headWheelBtn  = topBtn(9, "HeadWheelToggle", "头轮盘")
+        local themeBtnM     = topBtn(10, "ThemeBtn",  "主题")
+
+        headWheelOn = false
+        bindTap(headWheelBtn, function()
+            headWheelOn = not headWheelOn
+            if headBase then headBase.Visible = headWheelOn end
+            headWheelBtn.Text = headWheelOn and "头轮盘✓" or "头轮盘"
+            if headWheelOn then
+                headWheelBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+                headWheelBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+            else
+                headWheelBtn.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+                headWheelBtn.TextColor3 = Color3.fromRGB(240, 242, 250)
+                headTiltTargetRoll = 0
+                headTiltTargetPitch = 0
+                if headKnob then headKnob.Position = UDim2.fromScale(0.5, 0.5) end
+            end
+        end)
+
+        local setFocusMode
+
+        bindTap(followBtnM, function()
+            headFollowEnabled = not headFollowEnabled
+            followBtnM.Text = headFollowEnabled and "跟头" or "跟头✓"
+            handAnchorRot.L = nil
+            handAnchorRot.R = nil
+            if headFollowEnabled and freeCamMode then
+                freeCamMode = false
+                freeCamBodyCFrame = nil
+                if freeCamBtnRef then freeCamBtnRef.Text = "自由头部视角" end
+            end
+        end)
+
+        bindTap(wheelBtnM, function()
+            local now = not _G.__NoVR_isWheelHand()
+            _G.__NoVR_setWheelHand(now)
+            wheelBtnM.Text = now and "轮盘✓" or "轮盘"
+            if setFocusMode then setFocusMode(now) end
+        end)
+
+        bindTap(headGyroBtnM, function()
+            headGyroEnabled = not headGyroEnabled
+            headGyroBtnM.Text = headGyroEnabled and "头陀✓" or "头陀"
+            if not headGyroEnabled then
+                headGyroBase = nil
+                headGyroLastYaw = 0
+                headGyroLastPitch = 0
+            end
+        end)
+
+        bindTap(scaleBtnM, function()
+            scalePanel.Visible = not scalePanel.Visible
+        end)
+
+        bindTap(themeBtnM, function()
+            themePanel.Visible = not themePanel.Visible
+            themeBtnM.Text = themePanel.Visible and "主题✓" or "主题"
+            if themePanel.Visible then
+                collectThemeTargets()
+            end
+        end)
+
+        local function applyScaleAndCooldown()
+            if scaleCooling then return end
+            local num = tonumber(scaleBox.Text)
+            if not num then return end
+            num = math.floor(num)
+            if num < 10 or num > 100 then return end
+            if scaleSetEvent then
+                pcall(function()
+                    scaleSetEvent:FireServer({ Settings = { vrscale = num / 10 } })
+                end)
+            end
+            scalePanel.Visible = false
+            scaleCooling = true
+            scaleRem = 15
+            scaleBtnM.Text = "冷却" .. scaleRem .. "s"
+            task.spawn(function()
+                while scaleRem > 0 do
+                    task.wait(1)
+                    scaleRem = scaleRem - 1
+                    if scaleRem > 0 then
+                        scaleBtnM.Text = "冷却" .. scaleRem .. "s"
+                    end
+                end
+                scaleCooling = false
+                scaleBtnM.Text = "体型"
+            end)
+        end
+        bindTap(scaleOk, applyScaleAndCooldown)
+        scaleBox.FocusLost:Connect(function(enter)
+            if enter then applyScaleAndCooldown() end
+        end)
+
+        local uiHidden = false
+        local funcWrapVisible = true
+        local infoPanelVisible = true
+        local funcWrap, infoPanel
+        local FUNC_Y_SHOW, FUNC_Y_HIDE = 0.10, -0.50
+        local funcTween = nil
+
+        local function setFuncWrapVisible(show)
+            if not funcWrap then return end
+            funcWrapVisible = show
+            if funcTween then funcTween:Cancel() end
+            if show then
+                funcWrap.Visible = true
+                funcTween = TweenService:Create(funcWrap,
+                    TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+                    {Position = UDim2.new(0.99, 0, FUNC_Y_SHOW, 0)})
+                funcTween:Play()
+            else
+                funcTween = TweenService:Create(funcWrap,
+                    TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                    {Position = UDim2.new(0.99, 0, FUNC_Y_HIDE, 0)})
+                funcTween.Completed:Connect(function() funcWrap.Visible = false end)
+                funcTween:Play()
+            end
+        end
+
+        bindTap(toggleUIBtn, function()
+            uiHidden = not uiHidden
+            for _, child in ipairs(mobileGui:GetChildren()) do
+                if child:IsA("GuiObject") and child ~= toggleUIBtn and child ~= tiltToggleBtn
+                and child ~= funcToggleBtn and child ~= infoToggleBtn and child ~= scaleBtnM
+                and child ~= followBtnM and child ~= wheelBtnM and child ~= headGyroBtnM
+                and child ~= themeBtnM and child ~= headWheelBtn
+                and child ~= scalePanel and child ~= themePanel
+                and child ~= libraryPanel and child ~= recStatusRef then
+                    child.Visible = not uiHidden
+                end
+            end
+            if not uiHidden then
+                if funcWrap then funcWrap.Visible = funcWrapVisible end
+                if infoPanel then infoPanel.Visible = infoPanelVisible end
+            end
+            toggleUIBtn.Text = uiHidden and "显示" or "隐藏"
+        end)
+
+        bindTap(tiltToggleBtn, function()
+            autoTiltEnabled = not autoTiltEnabled
+            tiltToggleBtn.Text = autoTiltEnabled and "侧倾" or "侧倾✓"
+        end)
+
+        bindTap(funcToggleBtn, function()
+            setFuncWrapVisible(not funcWrapVisible)
+            funcToggleBtn.Text = funcWrapVisible and "功能" or "功能▲"
+        end)
+
+        bindTap(infoToggleBtn, function()
+            infoPanelVisible = not infoPanelVisible
+            if infoPanel then infoPanel.Visible = infoPanelVisible end
+            infoToggleBtn.Text = infoPanelVisible and "参数" or "参数▲"
+        end)
+
+        local gp = Instance.new("Frame")
+        gp.Size = UDim2.fromScale(0.30, 0.28)
+        gp.Position = UDim2.fromScale(0.02, 0.16)
+        gp.AnchorPoint = Vector2.new(0, 0)
+        gp.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        gp.BackgroundTransparency = 0.35
+        gp.BorderSizePixel = 0
+        gp.Parent = mobileGui
+        Instance.new("UICorner", gp).CornerRadius = UDim.new(0, 14)
+        local gpStroke = Instance.new("UIStroke", gp)
+        gpStroke.Color = Color3.fromRGB(230, 230, 240)
+        gpStroke.Transparency = 0.5
+        gpStroke.Thickness = 1.5
+        local pad = Instance.new("UIPadding", gp)
+        pad.PaddingTop = UDim.new(0.03, 0); pad.PaddingBottom = UDim.new(0.03, 0)
+        pad.PaddingLeft = UDim.new(0.04, 0); pad.PaddingRight = UDim.new(0.04, 0)
+
+        local handBar = Instance.new("Frame")
+        handBar.Size = UDim2.fromScale(1, 0.18)
+        handBar.Position = UDim2.fromScale(0, 0)
+        handBar.BackgroundTransparency = 1
+        handBar.Parent = gp
+
+        local tagL = createBtn(handBar, "TagL", UDim2.fromScale(0, 0), UDim2.fromScale(0.31, 1), "左手", 12)
+        local tagR = createBtn(handBar, "TagR", UDim2.fromScale(0.345, 0), UDim2.fromScale(0.31, 1), "右手", 12)
+        local tagB = createBtn(handBar, "TagB", UDim2.fromScale(0.69, 0), UDim2.fromScale(0.31, 1), "双手", 12)
+
+        local function refreshHandTags()
+            tagL.BackgroundColor3 = (selHand == "L") and Color3.fromRGB(255,255,255) or Color3.fromRGB(18,18,22)
+            tagL.TextColor3 = (selHand == "L") and Color3.fromRGB(0,0,0) or Color3.fromRGB(240,242,250)
+            tagR.BackgroundColor3 = (selHand == "R") and Color3.fromRGB(255,255,255) or Color3.fromRGB(18,18,22)
+            tagR.TextColor3 = (selHand == "R") and Color3.fromRGB(0,0,0) or Color3.fromRGB(240,242,250)
+            tagB.BackgroundColor3 = (selHand == "B") and Color3.fromRGB(255,255,255) or Color3.fromRGB(18,18,22)
+            tagB.TextColor3 = (selHand == "B") and Color3.fromRGB(0,0,0) or Color3.fromRGB(240,242,250)
+        end
+        refreshHandTags()
+
+        local zoneBtn = createBtn(mobileGui, "ZoneBtn",
+            UDim2.fromScale(0.02, 0.45), UDim2.fromOffset(96, 22), "陀螺分离 ▶", 12)
+
+        local gyroPanel = Instance.new("Frame")
+        gyroPanel.Size = UDim2.fromScale(0.30, 0.28)
+        gyroPanel.Position = UDim2.fromScale(0.02, 0.16)
+        gyroPanel.AnchorPoint = Vector2.new(0, 0)
+        gyroPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        gyroPanel.BackgroundTransparency = 0.35
+        gyroPanel.BorderSizePixel = 0
+        gyroPanel.Visible = false
+        gyroPanel.Parent = mobileGui
+        Instance.new("UICorner", gyroPanel).CornerRadius = UDim.new(0, 14)
+        local gyroPanelStroke = Instance.new("UIStroke", gyroPanel)
+        gyroPanelStroke.Color = Color3.fromRGB(230, 230, 240)
+        gyroPanelStroke.Transparency = 0.5
+        gyroPanelStroke.Thickness = 1.5
+
+        local gyroTitle = Instance.new("TextLabel")
+        gyroTitle.Size = UDim2.new(1, 0, 0, 22)
+        gyroTitle.Position = UDim2.new(0, 0, 0, 4)
+        gyroTitle.BackgroundTransparency = 1
+        gyroTitle.Text = "陀螺仪分离控制"
+        gyroTitle.TextColor3 = Color3.fromRGB(240, 242, 250)
+        gyroTitle.Font = Enum.Font.GothamSemibold
+        gyroTitle.TextSize = 13
+        gyroTitle.Parent = gyroPanel
+
+        local sepBtn = createBtn(gyroPanel, "SepBtn",
+            UDim2.fromScale(0.06, 0.20), UDim2.fromScale(0.88, 0.14),
+            "分离控制：关", 12)
+        bindTap(sepBtn, function()
+            gyroSepEnabled = not gyroSepEnabled
+            sepBtn.Text = gyroSepEnabled and "分离控制：开" or "分离控制：关"
+        end)
+
+        local handLbl = Instance.new("TextLabel")
+        handLbl.Size = UDim2.fromScale(0.88, 0.12)
+        handLbl.Position = UDim2.fromScale(0.06, 0.36)
+        handLbl.BackgroundTransparency = 1
+        handLbl.Text = "控制手：右手"
+        handLbl.TextColor3 = Color3.fromRGB(240, 242, 250)
+        handLbl.TextXAlignment = Enum.TextXAlignment.Left
+        handLbl.Font = Enum.Font.Gotham
+        handLbl.TextSize = 12
+        handLbl.Parent = gyroPanel
+
+        local sliderYLabel = Instance.new("TextLabel")
+        sliderYLabel.Size = UDim2.fromScale(0.20, 0.13)
+        sliderYLabel.Position = UDim2.fromScale(0.06, 0.52)
+        sliderYLabel.BackgroundTransparency = 1
+        sliderYLabel.Text = "上下转"
+        sliderYLabel.TextColor3 = Color3.fromRGB(200, 205, 220)
+        sliderYLabel.TextXAlignment = Enum.TextXAlignment.Left
+        sliderYLabel.Font = Enum.Font.Gotham
+        sliderYLabel.TextSize = 12
+        sliderYLabel.Parent = gyroPanel
+
+        local sliderYBar = Instance.new("Frame")
+        sliderYBar.Size = UDim2.fromScale(0.66, 0.13)
+        sliderYBar.Position = UDim2.fromScale(0.28, 0.52)
+        sliderYBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        sliderYBar.BackgroundTransparency = 0.78
+        sliderYBar.BorderSizePixel = 0
+        sliderYBar.Parent = gyroPanel
+        Instance.new("UICorner", sliderYBar).CornerRadius = UDim.new(1, 0)
+        local sliderYStroke = Instance.new("UIStroke", sliderYBar)
+        sliderYStroke.Color = Color3.fromRGB(255,255,255)
+        sliderYStroke.Transparency = 0.35
+        sliderYStroke.Thickness = 1.3
+
+        local sliderYKnob = Instance.new("Frame")
+        sliderYKnob.Size = UDim2.fromOffset(16, 16)
+        sliderYKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        sliderYKnob.Position = UDim2.fromScale(0.5, 0.5)
+        sliderYKnob.BackgroundColor3 = Color3.fromRGB(255,255,255)
+        sliderYKnob.BorderSizePixel = 0
+        sliderYKnob.Parent = sliderYBar
+        Instance.new("UICorner", sliderYKnob).CornerRadius = UDim.new(1, 0)
+
+        local sliderXLabel = Instance.new("TextLabel")
+        sliderXLabel.Size = UDim2.fromScale(0.20, 0.13)
+        sliderXLabel.Position = UDim2.fromScale(0.06, 0.70)
+        sliderXLabel.BackgroundTransparency = 1
+        sliderXLabel.Text = "左右转"
+        sliderXLabel.TextColor3 = Color3.fromRGB(200, 205, 220)
+        sliderXLabel.TextXAlignment = Enum.TextXAlignment.Left
+        sliderXLabel.Font = Enum.Font.Gotham
+        sliderXLabel.TextSize = 12
+        sliderXLabel.Parent = gyroPanel
+
+        local sliderXBar = Instance.new("Frame")
+        sliderXBar.Size = UDim2.fromScale(0.66, 0.13)
+        sliderXBar.Position = UDim2.fromScale(0.28, 0.70)
+        sliderXBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        sliderXBar.BackgroundTransparency = 0.78
+        sliderXBar.BorderSizePixel = 0
+        sliderXBar.Parent = gyroPanel
+        Instance.new("UICorner", sliderXBar).CornerRadius = UDim.new(1, 0)
+        local sliderXStroke = Instance.new("UIStroke", sliderXBar)
+        sliderXStroke.Color = Color3.fromRGB(255,255,255)
+        sliderXStroke.Transparency = 0.35
+        sliderXStroke.Thickness = 1.3
+
+        local sliderXKnob = Instance.new("Frame")
+        sliderXKnob.Size = UDim2.fromOffset(16, 16)
+        sliderXKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        sliderXKnob.Position = UDim2.fromScale(0.5, 0.5)
+        sliderXKnob.BackgroundColor3 = Color3.fromRGB(255,255,255)
+        sliderXKnob.BorderSizePixel = 0
+        sliderXKnob.Parent = sliderXBar
+        Instance.new("UICorner", sliderXKnob).CornerRadius = UDim.new(1, 0)
+
+        local dirResetBtn = createBtn(gyroPanel, "DirReset",
+            UDim2.fromScale(0.06, 0.86), UDim2.fromScale(0.42, 0.13), "复位", 12)
+        local dirLockBtn = createBtn(gyroPanel, "DirLock",
+            UDim2.fromScale(0.52, 0.86), UDim2.fromScale(0.42, 0.13), "锁定", 12)
+
+        local dragY, dragX = nil, nil
+        local dirTargetY, dirTargetX = 0, 0
+
+        local function currentHand()
+            if selHand == "L" then return handDir.L end
+            return handDir.R
+        end
+
+        local function refreshHandLbl()
+            handLbl.Text = "控制手：" .. (selHand == "L" and "左手" or selHand == "R" and "右手" or "双手")
+        end
+
+        local function syncSliders()
+            local hd = currentHand()
+            dirTargetX = hd.x; dirTargetY = hd.y
+            dirSliderX = hd.x; dirSliderY = hd.y
+            sliderXKnob.Position = UDim2.new((hd.x * 0.5) + 0.5, 0, 0.5, 0)
+            sliderYKnob.Position = UDim2.new((hd.y * 0.5) + 0.5, 0, 0.5, 0)
+            dirLockBtn.Text = hd.locked and "已锁" or "锁定"
+        end
+
+        local function commitHand()
+            local hd = currentHand()
+            hd.x = dirSliderX
+            hd.y = dirSliderY
+        end
+
+        bindTap(tagL, function()
+            commitHand()
+            selHand = "L"; refreshHandTags(); refreshHandLbl(); syncSliders()
+        end)
+        bindTap(tagR, function()
+            commitHand()
+            selHand = "R"; refreshHandTags(); refreshHandLbl(); syncSliders()
+        end)
+        bindTap(tagB, function()
+            commitHand()
+            selHand = "B"; refreshHandTags(); refreshHandLbl(); syncSliders()
+        end)
+        refreshHandLbl()
+        syncSliders()
+
+        local function updateSliderY(pos)
+            local absPos = sliderYBar.AbsolutePosition
+            local absSize = sliderYBar.AbsoluteSize
+            local tt = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+            sliderYKnob.Position = UDim2.new(tt, 0, 0.5, 0)
+            dirTargetY = (tt - 0.5) * 2
+        end
+        local function updateSliderX(pos)
+            local absPos = sliderXBar.AbsolutePosition
+            local absSize = sliderXBar.AbsoluteSize
+            local tt = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+            sliderXKnob.Position = UDim2.new(tt, 0, 0.5, 0)
+            dirTargetX = (tt - 0.5) * 2
+        end
+
+        UIS.TouchStarted:Connect(function(i)
+            local p = i.Position
+            local aY = sliderYBar.AbsolutePosition; local sY = sliderYBar.AbsoluteSize
+            if p.X >= aY.X and p.X <= aY.X + sY.X and p.Y >= aY.Y and p.Y <= aY.Y + sY.Y then
+                dragY = i; updateSliderY(p); return
+            end
+            local aX = sliderXBar.AbsolutePosition; local sX = sliderXBar.AbsoluteSize
+            if p.X >= aX.X and p.X <= aX.X + sX.X and p.Y >= aX.Y and p.Y <= aX.Y + sX.Y then
+                dragX = i; updateSliderX(p); return
+            end
+        end)
+        UIS.TouchMoved:Connect(function(i)
+            if i == dragY then updateSliderY(i.Position) end
+            if i == dragX then updateSliderX(i.Position) end
+        end)
+        UIS.TouchEnded:Connect(function(i)
+            if i == dragY then dragY = nil end
+            if i == dragX then dragX = nil end
+            commitHand()
+        end)
+
+        RunService.RenderStepped:Connect(function(dt)
+            local kk = 1 - math.exp(-8 * dt)
+            dirSliderY = dirSliderY + (dirTargetY - dirSliderY) * kk
+            dirSliderX = dirSliderX + (dirTargetX - dirSliderX) * kk
+            local hd = currentHand()
+            hd.x = dirSliderX
+            hd.y = dirSliderY
+        end)
+
+        local function fadeIn(guiObj)
+            guiObj.Visible = true
+            guiObj.BackgroundTransparency = 1
+            TweenService:Create(guiObj, TweenInfo.new(0.18), {BackgroundTransparency = 0.35}):Play()
+        end
+        local zoneOnGyro = false
+        bindTap(zoneBtn, function()
+            zoneOnGyro = not zoneOnGyro
+            if zoneOnGyro then
+                gp.Visible = false
+                fadeIn(gyroPanel)
+                zoneBtn.Text = "快捷动作 ▶"
+            else
+                gyroPanel.Visible = false
+                fadeIn(gp)
+                zoneBtn.Text = "陀螺分离 ▶"
+            end
+        end)
+
+        bindTap(dirResetBtn, function()
+            local hd = currentHand()
+            hd.x = 0; hd.y = 0
+            hd.locked = false
+            hd.lockWorldRot = nil
+            dirTargetX = 0; dirTargetY = 0
+            dirSliderX = 0; dirSliderY = 0
+            sliderXKnob.Position = UDim2.new(0.5, 0, 0.5, 0)
+            sliderYKnob.Position = UDim2.new(0.5, 0, 0.5, 0)
+            dirLockBtn.Text = "锁定"
+        end)
+        bindTap(dirLockBtn, function()
+            local hd = currentHand()
+            hd.locked = not hd.locked
+            if hd.locked then
+                local camRot = cam.CFrame.Rotation
+                local selfRot = CFrame.fromEulerAnglesYXZ(hd.y * 1.2, hd.x * 1.2, 0)
+                hd.lockWorldRot = camRot * selfRot
+                dirLockBtn.Text = "已锁"
+            else
+                hd.lockWorldRot = nil
+                dirLockBtn.Text = "锁定"
+            end
+        end)
+
+        local gArea = Instance.new("Frame")
+        gArea.Size = UDim2.fromScale(1, 0.78)
+        gArea.Position = UDim2.fromScale(0, 0.22)
+        gArea.BackgroundTransparency = 1
+        gArea.Parent = gp
+
+        local gcols, grows = 2, 3
+        local ggap = 0.05
+        local gbw = (1 - ggap*(gcols-1)) / gcols
+        local gbh = (1 - ggap*(grows-1)) / grows
+        local function gcell(c, r) return UDim2.fromScale((gbw+ggap)*c, (gbh+ggap)*r) end
+
+        local gNames = {"punch", "spin", "come", "thumb", "point", "fist"}
+        local gLabels = {"挥拳", "手转", "指人", "拇指", "指", "喝水"}
+        for i = 1, 6 do
+            local c = (i - 1) % 2
+            local r = math.floor((i - 1) / 2)
+            local b = createBtn(gArea, "G_"..gNames[i], gcell(c, r), UDim2.fromScale(gbw, gbh), gLabels[i], 13)
+            local name = gNames[i]
+            if i == 2 then
+                bindTap(b, function()
+                    spinMode = not spinMode
+                    spinAngle = 0
+                    b.Text = spinMode and "手转●" or "手转"
+                end)
+            else
+                bindTap(b, function() gesturePlay(name, selHand) end)
+            end
+        end
+
+        -- ✅ ↑↓ 小按钮：46×78，放在移动摇杆的正右侧
+        local vert = Instance.new("Frame")
+        vert.Size = UDim2.fromOffset(46, 78)
+        vert.Position = UDim2.new(0, 145, 1, -20)
+        vert.AnchorPoint = Vector2.new(0, 1)
+        vert.BackgroundTransparency = 1
+        vert.Parent = mobileGui
+        local ascend = createBtn(vert, "Ascend", UDim2.fromScale(0, 0), UDim2.fromScale(1, 0.46), "↑", 16)
+        local descend = createBtn(vert, "Descend", UDim2.fromScale(0, 1), UDim2.fromScale(1, 0.46), "↓", 16)
+        descend.AnchorPoint = Vector2.new(0, 1)
+        local function bindHold(btn, key)
+            local pressed = false
+            btn.InputBegan:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch then
+                    pressed = true; keys[key] = true
+                end
+            end)
+            btn.InputChanged:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch and pressed then
+                    local ap = btn.AbsolutePosition
+                    local as = btn.AbsoluteSize
+                    local ok = i.Position.X >= ap.X - 20 and i.Position.X <= ap.X + as.X + 20
+                           and i.Position.Y >= ap.Y - 20 and i.Position.Y <= ap.Y + as.Y + 20
+                    keys[key] = ok
+                end
+            end)
+            btn.InputEnded:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Touch then
+                    pressed = false; keys[key] = false
+                end
+            end)
+        end
+        bindHold(ascend, Enum.KeyCode.Space)
+        bindHold(descend, Enum.KeyCode.LeftShift)
+
+        local stickBase = Instance.new("Frame")
+        stickBase.Size = UDim2.fromOffset(110, 110)
+        stickBase.Position = UDim2.new(0, 20, 1, -20)
+        stickBase.AnchorPoint = Vector2.new(0, 1)
+        stickBase.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        stickBase.BackgroundTransparency = 0.55
+        stickBase.BorderSizePixel = 0
+        stickBase.Parent = mobileGui
+        Instance.new("UICorner", stickBase).CornerRadius = UDim.new(1, 0)
+        local baseStroke = Instance.new("UIStroke", stickBase)
+        baseStroke.Color = Color3.fromRGB(0, 0, 0); baseStroke.Transparency = 0.4; baseStroke.Thickness = 2
+
+        local stickKnob = Instance.new("Frame")
+        stickKnob.Size = UDim2.fromOffset(42, 42)
+        stickKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        stickKnob.Position = UDim2.fromScale(0.5, 0.5)
+        stickKnob.BackgroundColor3 = Color3.fromRGB(0, 0, 0); stickKnob.BackgroundTransparency = 0.15
+        stickKnob.BorderSizePixel = 0
+        stickKnob.Parent = stickBase
+        Instance.new("UICorner", stickKnob).CornerRadius = UDim.new(1, 0)
+        local knobStroke = Instance.new("UIStroke", stickKnob)
+        knobStroke.Color = Color3.fromRGB(255, 255, 255); knobStroke.Transparency = 0.2; knobStroke.Thickness = 2
+
+        local stickTouch = nil
+        local stickCenterX, stickCenterY, stickRadius = 0, 0, 0
+        local DEADZONE = 0.25
+
+        local function stickReset()
+            keys[Enum.KeyCode.W] = false; keys[Enum.KeyCode.S] = false
+            keys[Enum.KeyCode.A] = false; keys[Enum.KeyCode.D] = false
+            stickKnob.Position = UDim2.fromScale(0.5, 0.5)
+        end
+
+        local function stickUpdate(touchPos)
+            local dx = touchPos.X - stickCenterX
+            local dy = touchPos.Y - stickCenterY
+            local dist = math.sqrt(dx*dx + dy*dy)
+            if dist > stickRadius then dx = dx / dist * stickRadius; dy = dy / dist * stickRadius end
+            stickKnob.Position = UDim2.new(0.5, dx, 0.5, dy)
+            local nx, ny = dx / stickRadius, dy / stickRadius
+            keys[Enum.KeyCode.W] = ny < -DEADZONE
+            keys[Enum.KeyCode.S] = ny >  DEADZONE
+            keys[Enum.KeyCode.A] = nx < -DEADZONE
+            keys[Enum.KeyCode.D] = nx >  DEADZONE
+        end
+
+        UIS.TouchStarted:Connect(function(i)
+            if stickTouch then return end
+            local absPos = stickBase.AbsolutePosition
+            local absSize = stickBase.AbsoluteSize
+            if i.Position.X >= absPos.X and i.Position.X <= absPos.X + absSize.X
+               and i.Position.Y >= absPos.Y and i.Position.Y <= absPos.Y + absSize.Y then
+                stickTouch = i
+                stickCenterX = absPos.X + absSize.X / 2
+                stickCenterY = absPos.Y + absSize.Y / 2
+                stickRadius = absSize.X / 2
+                stickBase.BackgroundTransparency = 0.35
+                stickUpdate(i.Position)
+            end
+        end)
+        UIS.TouchMoved:Connect(function(i)
+            if i ~= stickTouch then return end
+            stickUpdate(i.Position)
+        end)
+        UIS.TouchEnded:Connect(function(i)
+            if i ~= stickTouch then return end
+            stickTouch = nil
+            stickBase.BackgroundTransparency = 0.55
+            stickReset()
+        end)
+
+        headBase = Instance.new("Frame")
+        headBase.Size = UDim2.fromOffset(80, 80)
+        headBase.Position = UDim2.new(1, -20, 0.5, 0)
+        headBase.AnchorPoint = Vector2.new(1, 0.5)
+        headBase.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        headBase.BackgroundTransparency = 0.55
+        headBase.BorderSizePixel = 0
+        headBase.Visible = false
+        headBase.Parent = mobileGui
+        Instance.new("UICorner", headBase).CornerRadius = UDim.new(1, 0)
+        local headStroke = Instance.new("UIStroke", headBase)
+        headStroke.Color = Color3.fromRGB(0, 0, 0); headStroke.Transparency = 0.4; headStroke.Thickness = 2
+
+        headKnob = Instance.new("Frame")
+        headKnob.Size = UDim2.fromOffset(30, 30)
+        headKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        headKnob.Position = UDim2.fromScale(0.5, 0.5)
+        headKnob.BackgroundColor3 = Color3.fromRGB(0, 0, 0); headKnob.BackgroundTransparency = 0.15
+        headKnob.BorderSizePixel = 0
+        headKnob.Parent = headBase
+        Instance.new("UICorner", headKnob).CornerRadius = UDim.new(1, 0)
+        local headKnobStroke = Instance.new("UIStroke", headKnob)
+        headKnobStroke.Color = Color3.fromRGB(255, 255, 255); headKnobStroke.Transparency = 0.2; headKnobStroke.Thickness = 2
+
+        local headTouch = nil
+        local headCenterX, headCenterY, headRadius = 0, 0, 0
+
+        local function headUpdate(touchPos)
+            local dx = touchPos.X - headCenterX
+            local dy = touchPos.Y - headCenterY
+            local dist = math.sqrt(dx*dx + dy*dy)
+            if dist > headRadius then dx = dx / dist * headRadius; dy = dy / dist * headRadius end
+            headKnob.Position = UDim2.new(0.5, dx, 0.5, dy)
+            headTiltTargetRoll = -(dx / headRadius) * S.manualTiltMax
+            headTiltTargetPitch = (dy / headRadius) * S.manualTiltMax
+        end
+
+        UIS.TouchStarted:Connect(function(i)
+            if not headBase.Visible then return end
+            if headTouch then return end
+            local absPos = headBase.AbsolutePosition
+            local absSize = headBase.AbsoluteSize
+            if i.Position.X >= absPos.X and i.Position.X <= absPos.X + absSize.X
+               and i.Position.Y >= absPos.Y and i.Position.Y <= absPos.Y + absSize.Y then
+                headTouch = i
+                headDragging = true
+                headCenterX = absPos.X + absSize.X / 2
+                headCenterY = absPos.Y + absSize.Y / 2
+                headRadius = absSize.X / 2
+                headBase.BackgroundTransparency = 0.35
+                headUpdate(i.Position)
+            end
+        end)
+        UIS.TouchMoved:Connect(function(i)
+            if i ~= headTouch then return end
+            headUpdate(i.Position)
+        end)
+        UIS.TouchEnded:Connect(function(i)
+            if i ~= headTouch then return end
+            headTouch = nil
+            headDragging = false
+            headBase.BackgroundTransparency = 0.55
+            headKnob.Position = UDim2.fromScale(0.5, 0.5)
+            headTiltTargetRoll = 0
+            headTiltTargetPitch = 0
+        end)
+
+        local grab = Instance.new("Frame")
+        grab.Size = UDim2.fromScale(0.40, 0.26)
+        grab.Position = UDim2.fromScale(0.98, 0.98)
+        grab.AnchorPoint = Vector2.new(1, 1)
+        grab.BackgroundTransparency = 1
+        grab.Parent = mobileGui
+        local gapp = 0.08
+        local bw2 = (1 - gapp) / 2
+        local bh2 = (1 - gapp) / 2
+
+        local grabL  = applyStroke(createBtn(grab, "GrabL",  UDim2.fromScale(0, 0), UDim2.fromScale(bw2, bh2), "左抓", 18), 2, 0.15)
+        local grabR  = applyStroke(createBtn(grab, "GrabR",  UDim2.fromScale(1, 0), UDim2.fromScale(bw2, bh2), "右抓", 18), 2, 0.15)
+        grabR.AnchorPoint = Vector2.new(1, 0)
+        local pinchL = applyStroke(createBtn(grab, "PinchL", UDim2.fromScale(0, 1), UDim2.fromScale(bw2, bh2), "左捏", 17), 2, 0.15)
+        local pinchR = applyStroke(createBtn(grab, "PinchR", UDim2.fromScale(1, 1), UDim2.fromScale(bw2, bh2), "右捏", 17), 2, 0.15)
+        pinchL.AnchorPoint = Vector2.new(0, 1)
+        pinchR.AnchorPoint = Vector2.new(1, 1)
+
+        makeHold(grabL, function()
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.lFist = Input.lFist == 1 and 0 or 1
+                    Input.lIndex = Input.lIndex == 1 and 0 or 1
+                else
+                    Input.lFist = 1; Input.lIndex = 1
+                    grabOverride.L = true
+                end
+            end
+        end, function()
+            if Input and not S.toggleGrabMode then Input.lFist = 0; Input.lIndex = 0 end
+            grabOverride.L = false
+        end)
+
+        makeHold(grabR, function()
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.rFist = Input.rFist == 1 and 0 or 1
+                    Input.rIndex = Input.rIndex == 1 and 0 or 1
+                else
+                    Input.rFist = 1; Input.rIndex = 1
+                    grabOverride.R = true
+                end
+            end
+        end, function()
+            if Input and not S.toggleGrabMode then Input.rFist = 0; Input.rIndex = 0 end
+            grabOverride.R = false
+        end)
+
+        makeHold(pinchL, function()
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.lIndex = Input.lIndex == 1 and 0 or 1
+                    if Input.lIndex == 1 then Input.lFist = 0; Input.lThumb = 0 end
+                else
+                    Input.lIndex = 1; Input.lFist = 0; Input.lThumb = 0
+                    grabOverride.L = true
+                end
+            end
+        end, function()
+            if Input and not S.toggleGrabMode then Input.lIndex = 0 end
+            grabOverride.L = false
+        end)
+
+        makeHold(pinchR, function()
+            refreshInput()
+            if Input then
+                if S.toggleGrabMode then
+                    Input.rIndex = Input.rIndex == 1 and 0 or 1
+                    if Input.rIndex == 1 then Input.rFist = 0; Input.rThumb = 0 end
+                else
+                    Input.rIndex = 1; Input.rFist = 0; Input.rThumb = 0
+                    grabOverride.R = true
+                end
+            end
+        end, function()
+            if Input and not S.toggleGrabMode then Input.rIndex = 0 end
+            grabOverride.R = false
+        end)
+
+        funcWrap = Instance.new("Frame")
+        funcWrap.Size = UDim2.fromScale(0.60, 0.24)
+        funcWrap.Position = UDim2.new(0.99, 0, FUNC_Y_SHOW, 0)
+        funcWrap.AnchorPoint = Vector2.new(1, 0)
+        funcWrap.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        funcWrap.BackgroundTransparency = 0.35
+        funcWrap.BorderSizePixel = 0
+        funcWrap.Parent = mobileGui
+        Instance.new("UICorner", funcWrap).CornerRadius = UDim.new(0, 14)
+        local funcStroke = Instance.new("UIStroke", funcWrap)
+        funcStroke.Color = Color3.fromRGB(230, 230, 240)
+        funcStroke.Transparency = 0.5
+        funcStroke.Thickness = 1.5
+
+        local cols, rowH, fgap = 6, 0.22, 0.03
+        local fw = (1 - fgap * (cols - 1)) / cols
+        local function cellPos(col, row) return UDim2.fromScale((fw + fgap) * col, (rowH + fgap) * row) end
+
+        local reachUp   = createBtn(funcWrap, "ReachUp",   cellPos(0, 0), UDim2.fromScale(fw, rowH), "手长+", 10)
+        local reachDown = createBtn(funcWrap, "ReachDown", cellPos(1, 0), UDim2.fromScale(fw, rowH), "手长-", 10)
+        local grabUp    = createBtn(funcWrap, "GrabUp",    cellPos(2, 0), UDim2.fromScale(fw, rowH), "抓距+", 10)
+        local grabDown  = createBtn(funcWrap, "GrabDown",  cellPos(3, 0), UDim2.fromScale(fw, rowH), "抓距-", 10)
+        local handGyroUp   = createBtn(funcWrap, "HandGyroUp",   cellPos(4, 0), UDim2.fromScale(fw, rowH), "手陀+", 10)
+        local handGyroDown = createBtn(funcWrap, "HandGyroDown", cellPos(5, 0), UDim2.fromScale(fw, rowH), "手陀-", 10)
+
+        local speedUp   = createBtn(funcWrap, "SpeedUp",   cellPos(0, 1), UDim2.fromScale(fw, rowH), "速度+", 10)
+        local speedDown = createBtn(funcWrap, "SpeedDown", cellPos(1, 1), UDim2.fromScale(fw, rowH), "速度-", 10)
+        local sensUp    = createBtn(funcWrap, "SensUp",    cellPos(2, 1), UDim2.fromScale(fw, rowH), "灵敏+", 10)
+        local sensDown  = createBtn(funcWrap, "SensDown",  cellPos(3, 1), UDim2.fromScale(fw, rowH), "灵敏-", 10)
+        local headGyroUp   = createBtn(funcWrap, "HeadGyroUp",   cellPos(4, 1), UDim2.fromScale(fw, rowH), "头陀+", 10)
+        local headGyroDown = createBtn(funcWrap, "HeadGyroDown", cellPos(5, 1), UDim2.fromScale(fw, rowH), "头陀-", 10)
+
+        local wheelUp   = createBtn(funcWrap, "WheelUp",   cellPos(0, 2), UDim2.fromScale(fw, rowH), "轮盘+", 10)
+        local wheelDown = createBtn(funcWrap, "WheelDown", cellPos(1, 2), UDim2.fromScale(fw, rowH), "轮盘-", 10)
+        local modeBtn   = createBtn(funcWrap, "ModeBtn",   cellPos(2, 2), UDim2.fromScale(fw, rowH), "模式长按", 8)
+        local gyroBtn   = createBtn(funcWrap, "GyroBtn",   cellPos(3, 2), UDim2.fromScale(fw, rowH), "陀螺仪", 10)
+        local recordBtn = createBtn(funcWrap, "RecordBtn", cellPos(4, 2), UDim2.fromScale(fw, rowH), "录手", 10)
+        local playbackBtn = createBtn(funcWrap, "PlaybackBtn", cellPos(5, 2), UDim2.fromScale(fw, rowH), "回放", 10)
+
+        local freeCamBtn = createBtn(funcWrap, "FreeCamBtn", cellPos(0, 3), UDim2.fromScale(fw, rowH), "自由头部视角", 8)
+        local libraryBtn = createBtn(funcWrap, "LibraryBtn", cellPos(1, 3), UDim2.fromScale(fw, rowH), "录制库", 8)
+        local resetHandsBtn = createBtn(funcWrap, "ResetHands", cellPos(2, 3), UDim2.fromScale(fw, rowH), "手复位", 10)
+
+        gyroBtnRef = gyroBtn
+        recordBtnRef = recordBtn
+        playbackBtnRef = playbackBtn
+        freeCamBtnRef = freeCamBtn
+
+        bindTap(libraryBtn, function()
+            libraryPanel.Visible = not libraryPanel.Visible
+            if libraryPanel.Visible then
+                refreshLibraryListRef()
+            end
+        end)
+
+        bindTap(resetHandsBtn, function()
+            resetHands()
+            resetHandsBtn.Text = "已复位"
+            task.delay(0.6, function()
+                resetHandsBtn.Text = "手复位"
+            end)
+        end)
+
+        bindTap(reachUp, function() S.reach = math.clamp(S.reach + 0.1, 0.05, 20) end)
+        bindTap(reachDown, function() S.reach = math.clamp(S.reach - 0.1, 0.05, 20) end)
+        bindTap(grabUp, function() S.grabRadiusMult = math.clamp(S.grabRadiusMult + 0.1, 0.1, 10) end)
+        bindTap(grabDown, function() S.grabRadiusMult = math.clamp(S.grabRadiusMult - 0.1, 0.1, 10) end)
+        bindTap(handGyroUp, function()
+            S.gyroPosK = math.clamp(S.gyroPosK + 0.05, 0, 3)
+            S.gyroPosMax = math.clamp(S.gyroPosMax + 0.05, 0.1, 5)
+        end)
+        bindTap(handGyroDown, function()
+            S.gyroPosK = math.clamp(S.gyroPosK - 0.05, 0, 3)
+            S.gyroPosMax = math.clamp(S.gyroPosMax - 0.05, 0.1, 5)
+        end)
+        bindTap(speedUp, function() S.speedMult = math.clamp(S.speedMult + 0.1, 0.1, 10) end)
+        bindTap(speedDown, function() S.speedMult = math.clamp(S.speedMult - 0.1, 0.1, 10) end)
+        bindTap(sensUp, function()
+            S.gyroRotK = math.clamp(S.gyroRotK + 0.2, 0.1, 5)
+            S.gyroPosK = math.clamp(S.gyroPosK + 0.05, 0, 3)
+        end)
+        bindTap(sensDown, function()
+            S.gyroRotK = math.clamp(S.gyroRotK - 0.2, 0.1, 5)
+            S.gyroPosK = math.clamp(S.gyroPosK - 0.05, 0, 3)
+        end)
+
+        bindTap(headGyroUp, function()
+            S.headGyroSens = math.clamp(S.headGyroSens + 0.1, 0.1, 3.0)
+        end)
+        bindTap(headGyroDown, function()
+            S.headGyroSens = math.clamp(S.headGyroSens - 0.1, 0.1, 3.0)
+        end)
+
+        bindTap(wheelUp, function()
+            WHEEL_MAX_XY   = math.clamp(WHEEL_MAX_XY + 0.05, 0.1, 2.0)
+            WHEEL_MAX_UP   = math.clamp(WHEEL_MAX_UP + 0.05, 0.1, 2.0)
+            WHEEL_MAX_FWD  = math.clamp(WHEEL_MAX_FWD + 0.05, 0.1, 2.0)
+            WHEEL_ROT_MAX  = math.clamp(WHEEL_ROT_MAX + 0.1, 0.1, 2.5)
+            WHEEL_ROLL_MAX = math.clamp(WHEEL_ROLL_MAX + 0.05, 0.1, 1.5)
+        end)
+        bindTap(wheelDown, function()
+            WHEEL_MAX_XY   = math.clamp(WHEEL_MAX_XY - 0.05, 0.1, 2.0)
+            WHEEL_MAX_UP   = math.clamp(WHEEL_MAX_UP - 0.05, 0.1, 2.0)
+            WHEEL_MAX_FWD  = math.clamp(WHEEL_MAX_FWD - 0.05, 0.1, 2.0)
+            WHEEL_ROT_MAX  = math.clamp(WHEEL_ROT_MAX - 0.1, 0.1, 2.5)
+            WHEEL_ROLL_MAX = math.clamp(WHEEL_ROLL_MAX - 0.05, 0.1, 1.5)
+        end)
+
+        bindTap(modeBtn, function()
+            S.toggleGrabMode = not S.toggleGrabMode
+            modeBtn.Text = S.toggleGrabMode and "模式切换" or "模式长按"
+        end)
+
+        bindTap(recordBtn, function()
+            if freeCamMode then
+                freeCamMode = false
+                freeCamBodyCFrame = nil
+                freeCamBtn.Text = "自由头部视角"
+            end
+            if playbackMode then
+                playbackMode = false
+                playbackBtn.Text = "回放"
+            end
+            if recordMode then
+                recordMode = false
+                recordBtn.Text = "录手"
+                recordCount = maxRecordFrame
+                print(("[NoVR] 录制完成，共 %d 帧 (%.2fs)"):format(recordCount, recordCount / 60))
+                if maxRecordFrame > 0 then
+                    recordCounter = recordCounter + 1
+                    table.insert(recordLibrary, {
+                        name = "录制 " .. recordCounter,
+                        frames = recordFrames,
+                        maxFrame = maxRecordFrame,
+                        duration = maxRecordFrame / 60,
+                    })
+                    if #recordLibrary > RECORD_LIBRARY_MAX then
+                        table.remove(recordLibrary, 1)
+                        print("[NoVR] 录制库已满，自动删除最早的录制")
+                    end
+                    refreshLibraryListRef()
+                    print(("[NoVR] 已保存到录制库 (%d/%d)"):format(#recordLibrary, RECORD_LIBRARY_MAX))
+                end
+            else
+                recordFrames = {}
+                maxRecordFrame = 0
+                frameCounter = 0
+                playbackFrame = 1
+                recordStartT = os.clock()
+                recordMode = true
+                recordBtn.Text = "停止●"
+                print("[NoVR] 开始录制...")
+            end
+        end)
+
+        bindTap(playbackBtn, function()
+            if recordMode then
+                recordMode = false
+                recordBtn.Text = "录手"
+                recordCount = maxRecordFrame
+            end
+            if playbackMode then
+                playbackMode = false
+                playbackBtn.Text = "回放"
+            else
+                if maxRecordFrame == 0 then
+                    print("[NoVR] 没有录制内容")
+                    return
+                end
+                playbackFrame = 1
+                playbackMode = true
+                playbackBtn.Text = "停止▶"
+                print(("[NoVR] 开始回放 (%d 帧)"):format(maxRecordFrame))
+            end
+        end)
+
+        bindTap(freeCamBtn, function()
+            freeCamMode = not freeCamMode
+            if freeCamMode then
+                freeCamBodyCFrame = CFrame.new(camPos) * cam.CFrame.Rotation
+                freeCamBtn.Text = "自头✓"
+                headFollowEnabled = false
+                followBtnM.Text = "跟头"
+                print("[NoVR] 自由头部视角：开启，本体已冻结")
+            else
+                freeCamBodyCFrame = nil
+                freeCamBtn.Text = "自由头部视角"
+                print("[NoVR] 自由头部视角：关闭")
+            end
+        end)
+
+        local gyroHoldT = nil
+        gyroBtn.InputBegan:Connect(function(i)
+            if i.UserInputType ~= Enum.UserInputType.Touch then return end
+            gyroHoldT = os.clock()
+        end)
+        gyroBtn.InputEnded:Connect(function(i)
+            if i.UserInputType ~= Enum.UserInputType.Touch then return end
+            local held = os.clock() - (gyroHoldT or 0)
+            if held > 0.5 then
+                if gyroNow then gyroBase = gyroNow end
+                swayOffsetL = Vector3.zero; swayOffsetR = Vector3.zero
+                rotL = CFrame.new(); rotR = CFrame.new()
+                gyroPosL = Vector3.zero; gyroPosR = Vector3.zero
+                gyroBtn.Text = "校准✓"
+                task.delay(0.8, function() gyroBtn.Text = S.gyroEnabled and "陀螺仪" or "陀螺关" end)
+            else
+                S.gyroEnabled = not S.gyroEnabled
+                gyroBtn.Text = S.gyroEnabled and "陀螺仪" or "陀螺关"
+            end
+        end)
+
+        infoPanel = Instance.new("Frame")
+        infoPanel.Size = UDim2.fromScale(0.36, 0.24)
+        infoPanel.Position = UDim2.fromScale(0.99, 0.24)
+        infoPanel.AnchorPoint = Vector2.new(1, 0)
+        infoPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+        infoPanel.BackgroundTransparency = 0.35
+        infoPanel.BorderSizePixel = 0
+        infoPanel.Parent = mobileGui
+        Instance.new("UICorner", infoPanel).CornerRadius = UDim.new(0, 14)
+        local infoStroke = Instance.new("UIStroke", infoPanel)
+        infoStroke.Color = Color3.fromRGB(230, 230, 240)
+        infoStroke.Transparency = 0.5
+        infoStroke.Thickness = 1.5
+        local infoPad = Instance.new("UIPadding", infoPanel)
+        infoPad.PaddingTop = UDim.new(0.06, 0); infoPad.PaddingBottom = UDim.new(0.06, 0)
+        infoPad.PaddingLeft = UDim.new(0.05, 0); infoPad.PaddingRight = UDim.new(0.05, 0)
+
+        local infoLbl = Instance.new("TextLabel")
+        infoLbl.Size = UDim2.fromScale(1, 1); infoLbl.BackgroundTransparency = 1
+        infoLbl.TextColor3 = Color3.fromRGB(240, 242, 250)
+        infoLbl.TextXAlignment = Enum.TextXAlignment.Left
+        infoLbl.TextYAlignment = Enum.TextYAlignment.Top
+        infoLbl.Font = Enum.Font.Code; infoLbl.TextSize = 11
+        infoLbl.Text = ""; infoLbl.Parent = infoPanel
+
+        RunService.Heartbeat:Connect(function()
+            local recTxt
+            if recordMode then
+                recTxt = "录制中"
+            elseif playbackMode then
+                recTxt = ("回放 %d/%d"):format(playbackFrame, maxRecordFrame)
+            elseif maxRecordFrame > 0 then
+                recTxt = ("已录 %d 帧"):format(maxRecordFrame)
+            else
+                recTxt = "无"
+            end
+            local camTxt = freeCamMode and "自头✓" or "正常"
+            infoLbl.Text = ("手陀 %.2f  灵敏 %.2f\n手长 %.2f  抓距 %.1f\n速度 %.1f  体型 %.1f\n头陀 %.2f  轮盘 %.2f\n模式 %s  陀螺 %s  手转 %s\n录制 %s  相机 %s\n库 %d/%d")
+            :format(S.gyroPosK, S.gyroRotK, S.reach, S.grabRadiusMult,
+                    S.speedMult, S.scale,
+                    S.headGyroSens, WHEEL_MAX_XY,
+                    S.toggleGrabMode and "切换" or "长按",
+                    S.gyroEnabled and "开" or "关",
+                    spinMode and "开" or "关",
+                    recTxt, camTxt,
+                    #recordLibrary, RECORD_LIBRARY_MAX)
+        end)
+
+        local function pointInContainer(container, pos)
+            for _, obj in ipairs(container:GetDescendants()) do
+                if obj:IsA("GuiObject") and obj.Visible then
+                    local ap = obj.AbsolutePosition
+                    local as = obj.AbsoluteSize
+                    if pos.X >= ap.X and pos.X <= ap.X + as.X
+                       and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        local function pointOnAnyUI(pos)
+            if pointInContainer(mobileGui, pos) then return true end
+            local pg = lp:FindFirstChild("PlayerGui")
+            local wg = pg and pg:FindFirstChild("NoVR_WheelHand")
+            if wg and wg.Enabled and pointInContainer(wg, pos) then return true end
+            return false
+        end
+
+        local touchLookInput = nil
+        local touchLookStartPos = nil
+        local touchLookOnUI = false
+        local lastTouch = Vector2.zero
+        local JUMP_THRESHOLD = 150
+        local UI_RELEASE_DIST = 30
+
+        UIS.TouchStarted:Connect(function(i)
+            if touchLookInput then return end
+            if _G.__NoVR_isWheelHand and _G.__NoVR_isWheelHand() then
+                if _G.__NoVR_findWheelDrag and _G.__NoVR_findWheelDrag(i.Position) then
+                    return
+                end
+            end
+            if themePanel.Visible then
+                local ap, as = themePanel.AbsolutePosition, themePanel.AbsoluteSize
+                if i.Position.X >= ap.X and i.Position.X <= ap.X + as.X
+                   and i.Position.Y >= ap.Y and i.Position.Y <= ap.Y + as.Y then
+                    return
+                end
+            end
+            if libraryPanel.Visible then
+                local ap, as = libraryPanel.AbsolutePosition, libraryPanel.AbsoluteSize
+                if i.Position.X >= ap.X and i.Position.X <= ap.X + as.X
+                   and i.Position.Y >= ap.Y and i.Position.Y <= ap.Y + as.Y then
+                    return
+                end
+            end
+            local vp = workspace.CurrentCamera.ViewportSize
+            if i.Position.X > vp.X * 0.5 then
+                touchLookInput = i
+                touchLookStartPos = i.Position
+                lastTouch = i.Position
+                touchLookOnUI = pointOnAnyUI(i.Position)
+            end
+        end)
+
+        UIS.TouchMoved:Connect(function(i)
+            if i ~= touchLookInput then return end
+            if touchLookOnUI then
+                local d = i.Position - touchLookStartPos
+                if d.Magnitude < UI_RELEASE_DIST then return end
+                touchLookOnUI = false
+                lastTouch = i.Position
+                return
+            end
+            local d = i.Position - lastTouch
+            if d.Magnitude > JUMP_THRESHOLD then
+                lastTouch = i.Position
+                return
+            end
+            targetYaw   = targetYaw   - d.X * S.sens
+            targetPitch = math.clamp(targetPitch - d.Y * S.sensPitch, -1.55, 1.55)
+            lastTouch = i.Position
+        end)
+
+        UIS.TouchEnded:Connect(function(i)
+            if i ~= touchLookInput then return end
+            touchLookInput = nil
+            touchLookStartPos = nil
+            touchLookOnUI = false
+        end)
+
+        setFocusMode = function(on)
+            if on then
+                local keep = {
+                    toggleUIBtn, tiltToggleBtn, funcToggleBtn, infoToggleBtn, scaleBtnM,
+                    followBtnM, wheelBtnM, headGyroBtnM, themeBtnM, headWheelBtn,
+                    stickBase, vert,
+                }
+                for _, child in ipairs(mobileGui:GetChildren()) do
+                    if child:IsA("GuiObject") then
+                        local isKeep = false
+                        for _, k in ipairs(keep) do
+                            if child == k then isKeep = true; break end
+                        end
+                        child.Visible = isKeep
+                    end
+                end
+                if gp then gp.Visible = false end
+                if funcWrap then funcWrap.Visible = false end
+                funcWrapVisible = false
+                if infoPanel then infoPanel.Visible = false end
+                infoPanelVisible = false
+                if scalePanel then scalePanel.Visible = false end
+                if gyroPanel then gyroPanel.Visible = false end
+                if grab then grab.Visible = true end
+                if headBase then headBase.Visible = headWheelOn end
+                if zoneBtn then zoneBtn.Visible = false end
+                if themePanel then themePanel.Visible = false end
+                if libraryPanel then libraryPanel.Visible = false end
+                funcToggleBtn.Text = "功能"
+                infoToggleBtn.Text = "参数"
+            else
+                for _, child in ipairs(mobileGui:GetChildren()) do
+                    if child:IsA("GuiObject") then
+                        child.Visible = true
+                    end
+                end
+                if gp then gp.Visible = true end
+                if funcWrap then funcWrap.Visible = true; funcWrapVisible = true end
+                if infoPanel then infoPanel.Visible = true; infoPanelVisible = true end
+                if scalePanel then scalePanel.Visible = false end
+                if gyroPanel then gyroPanel.Visible = false end
+                if themePanel then themePanel.Visible = false end
+                if libraryPanel then libraryPanel.Visible = false end
+                if headBase then headBase.Visible = headWheelOn end
+                funcToggleBtn.Text = "功能"
+                infoToggleBtn.Text = "参数"
+                if zoneBtn then zoneBtn.Text = "陀螺分离 ▶" end
+            end
+        end
+    end)
+
+    print("[NoVR] control active.")
+end)
+]==]
+
+local function teleportToCurrentServer()
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, Players.LocalPlayer)
+    end)
+    if not ok then
+        warn("[VR Hands No-VR] reconnect failed: " .. tostring(err))
+        pcall(function() TeleportService:Teleport(game.PlaceId, Players.LocalPlayer) end)
+    end
+end
+
+local localExec = loadstring or load
+if localExec then
+    local fn, err = pcall(localExec, hrs)
+    if fn then
+        local ok, e = pcall(fn)
+        if not ok then warn("[VR Hands No-VR] local exec error: " .. tostring(e)) end
+    else
+        warn("[VR Hands No-VR] compile failed: " .. tostring(err))
+    end
+end
+
+if type(queue_on_teleport) == "function" then
+    queue_on_teleport(hrs)
+    task.delay(3, teleportToCurrentServer)
+elseif syn and type(syn.queue_on_teleport) == "function" then
+    syn.queue_on_teleport(hrs)
+    task.delay(3, teleportToCurrentServer)
+else
+    warn("[VR Hands No-VR] 执行器不支持 queue_on_teleport，只本地生效")
+end
